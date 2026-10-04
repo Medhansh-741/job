@@ -9,8 +9,11 @@ import { createClient } from "@/lib/supabase/client";
 export default function UploadPage() {
   const router = useRouter();
   const supabase = createClient();
+
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
 
   const handleSignOut = async () => {
     await supabase.auth.signOut();
@@ -26,27 +29,70 @@ export default function UploadPage() {
 
     if (!hasValidExt) {
       setError("Please select a valid PDF or DOCX file.");
+      setFile(null);
+      return;
+    }
+
+    if (selected.size === 0) {
+      setError("The selected file is empty (0 bytes).");
+      setFile(null);
       return;
     }
 
     if (selected.size > 5 * 1024 * 1024) {
       setError("File exceeds maximum allowed size of 5MB.");
+      setFile(null);
       return;
     }
 
     setError(null);
+    setSuccessMessage(null);
     setFile(selected);
   };
 
   const handleRemove = () => {
     setFile(null);
     setError(null);
+    setSuccessMessage(null);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!file) return;
-    // Dead UI interaction hook
+    if (!file || uploading) return;
+
+    setUploading(true);
+    setError(null);
+    setSuccessMessage(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      // Call BFF proxy endpoint -> forwards to FastAPI with user's JWT
+      const response = await fetch("/api/backend/resumes/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        const errorDetail =
+          data?.detail?.message ||
+          data?.detail ||
+          data?.error ||
+          "Validation failed. Please ensure your file is a valid resume.";
+        setError(typeof errorDetail === "string" ? errorDetail : JSON.stringify(errorDetail));
+      } else {
+        setSuccessMessage(
+          `Resume successfully validated and stored (${data.characters_extracted} characters parsed).`
+        );
+      }
+    } catch {
+      setError("Network or proxy error: Unable to connect to backend service.");
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
@@ -96,15 +142,26 @@ export default function UploadPage() {
 
         {/* Upload Form */}
         <form onSubmit={handleSubmit} className="space-y-5">
+          {error && (
+            <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700 leading-relaxed">
+              {error}
+            </div>
+          )}
+
+          {successMessage && (
+            <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 leading-relaxed">
+              {successMessage}
+            </div>
+          )}
+
           <FileDropzone
             selectedFile={file}
             onFileSelect={handleFileSelect}
             onRemoveFile={handleRemove}
-            error={error}
           />
 
-          <Button type="submit" disabled={!file}>
-            Continue to Matching
+          <Button type="submit" disabled={!file} isLoading={uploading}>
+            {uploading ? "Validating & Storing..." : "Continue to Matching"}
           </Button>
         </form>
 

@@ -37,15 +37,10 @@ async function proxyRequest(
       headers.set("Authorization", `Bearer ${session.access_token}`);
     }
 
-    // Prepare body for non-GET/HEAD methods
+    // Forward raw body stream directly for non-GET/HEAD methods
     let body: BodyInit | undefined = undefined;
     if (request.method !== "GET" && request.method !== "HEAD") {
-      const contentType = request.headers.get("content-type") || "";
-      if (contentType.includes("multipart/form-data")) {
-        body = await request.formData();
-      } else {
-        body = await request.arrayBuffer();
-      }
+      body = await request.arrayBuffer();
     }
 
     const response = await fetch(targetUrl, {
