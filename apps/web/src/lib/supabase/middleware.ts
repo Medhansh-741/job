@@ -48,9 +48,9 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  // If already authenticated and landing on the sign-in page, redirect to /dashboard
+  // If already authenticated and landing on the sign-in page, redirect to /upload
   if (user && isAuthPage) {
-    url.pathname = "/dashboard";
+    url.pathname = "/upload";
     return NextResponse.redirect(url);
   }
 
