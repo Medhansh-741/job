@@ -34,7 +34,7 @@ export default function AuthPage() {
         if (error) {
           setErrorMessage(error.message);
         } else {
-          router.push("/upload");
+          router.push("/dashboard");
           router.refresh();
         }
       } else {
@@ -46,7 +46,7 @@ export default function AuthPage() {
         if (error) {
           setErrorMessage(error.message);
         } else if (data.session) {
-          router.push("/upload");
+          router.push("/dashboard");
           router.refresh();
         } else {
           setInfoMessage("Verification email sent. Please check your inbox.");

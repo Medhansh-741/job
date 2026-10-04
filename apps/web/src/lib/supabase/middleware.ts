@@ -6,6 +6,19 @@ export async function updateSession(request: NextRequest) {
     request,
   });
 
+  const url = request.nextUrl.clone();
+  const isAuthPage = url.pathname === "/";
+  const isApiRoute = url.pathname.startsWith("/api");
+  const isPublicAsset =
+    url.pathname.startsWith("/_next") ||
+    url.pathname.startsWith("/favicon.ico") ||
+    url.pathname.includes(".");
+
+  // 1. Never block API routes or static assets with redundant middleware auth calls
+  if (isApiRoute || isPublicAsset) {
+    return supabaseResponse;
+  }
+
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -29,39 +42,33 @@ export async function updateSession(request: NextRequest) {
     }
   );
 
-  // Do not run Supabase code on static assets
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const url = request.nextUrl.clone();
-  const isAuthPage = url.pathname === "/";
-  const isApiRoute = url.pathname.startsWith("/api");
-  const isPublicAsset =
-    url.pathname.startsWith("/_next") ||
-    url.pathname.startsWith("/favicon.ico") ||
-    url.pathname.includes(".");
-
   // Protected route redirects
-  if (!user && !isAuthPage && !isApiRoute && !isPublicAsset) {
+  if (!user && !isAuthPage) {
     url.pathname = "/";
     return NextResponse.redirect(url);
   }
 
-  // If already authenticated and landing on the sign-in page, redirect to /upload
+  // If already authenticated and landing on the sign-in page, redirect to /dashboard
   if (user && isAuthPage) {
-    url.pathname = "/upload";
+    url.pathname = "/dashboard";
     return NextResponse.redirect(url);
   }
 
   // Content Security Policy & Security Headers
+  const supaDomain = (process.env.NEXT_PUBLIC_SUPABASE_URL || "https://jejdpxpwxwcsqqfvgbeb.supabase.co")
+    .replace(/^https?:\/\//, "");
+
   const cspHeader = `
     default-src 'self';
     script-src 'self' 'unsafe-eval' 'unsafe-inline';
     style-src 'self' 'unsafe-inline';
     img-src 'self' blob: data:;
     font-src 'self';
-    connect-src 'self' https://uefisekynsvefbcvaivb.supabase.co wss://uefisekynsvefbcvaivb.supabase.co http://127.0.0.1:8000;
+    connect-src 'self' https://${supaDomain} wss://${supaDomain} http://127.0.0.1:8000;
     frame-ancestors 'none';
     form-action 'self';
     base-uri 'self';

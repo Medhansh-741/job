@@ -53,6 +53,7 @@ def get_current_user(
                 signing_key.key,
                 algorithms=[alg],
                 audience="authenticated",
+                leeway=60,
             )
         else:
             if not SUPABASE_JWT_SECRET:
@@ -65,6 +66,7 @@ def get_current_user(
                 SUPABASE_JWT_SECRET,
                 algorithms=["HS256"],
                 audience="authenticated",
+                leeway=60,
             )
 
         user_id = payload.get("sub")

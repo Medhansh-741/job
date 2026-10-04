@@ -13,16 +13,9 @@ async function proxyRequest(
     const search = request.nextUrl.search;
     const targetUrl = `${FASTAPI_URL}/${path}${search}`;
 
-    // Get active user session from server-side cookies
-    const supabase = await createClient();
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-
     // Prepare headers for upstream FastAPI
     const headers = new Headers();
     request.headers.forEach((val, key) => {
-      // Avoid forwarding host or connection headers that conflict with upstream
       if (
         !["host", "connection", "content-length", "cookie"].includes(
           key.toLowerCase()
@@ -32,9 +25,16 @@ async function proxyRequest(
       }
     });
 
-    // Inject authenticated Supabase Bearer token if user is signed in
-    if (session?.access_token) {
-      headers.set("Authorization", `Bearer ${session.access_token}`);
+    // Check if client already provided Authorization header
+    if (!headers.has("Authorization")) {
+      const supabase = await createClient();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (session?.access_token) {
+        headers.set("Authorization", `Bearer ${session.access_token}`);
+      }
     }
 
     // Forward raw body stream directly for non-GET/HEAD methods
@@ -43,13 +43,18 @@ async function proxyRequest(
       body = await request.arrayBuffer();
     }
 
-    const response = await fetch(targetUrl, {
+    const fetchOptions: RequestInit = {
       method: request.method,
       headers,
-      body,
-      // @ts-expect-error duplex required for streaming in Node fetch
-      duplex: "half",
-    });
+    };
+
+    if (body) {
+      fetchOptions.body = body;
+      // @ts-expect-error duplex required when streaming body in Node fetch
+      fetchOptions.duplex = "half";
+    }
+
+    const response = await fetch(targetUrl, fetchOptions);
 
     const responseHeaders = new Headers();
     response.headers.forEach((val, key) => {
