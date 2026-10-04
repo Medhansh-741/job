@@ -1,0 +1,36 @@
+name: 12-Hour Job Catalog Crawler
+
+on:
+  schedule:
+    # Runs every 12 hours at 00:00 and 12:00 UTC
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    # Allows manual trigger anytime from GitHub Actions tab
+
+jobs:
+  crawl-and-sync:
+    name: Crawl ATS Boards & Sync Catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.txt
+
+      - name: Run Crawler & Supabase Sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python scripts/crawler/crawl_and_sync.py
