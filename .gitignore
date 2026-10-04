@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+.env.local
+
+# Turborepo & Next.js
+.turbo/
+.next/
+out/
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PII and generated data
+resumes/
+scripts/spike/data/
+scripts/seed/big_*.json
+scripts/seed/pool_*.txt
+
