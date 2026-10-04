@@ -1,7 +1,8 @@
 import os
+import json
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import pool
@@ -103,9 +104,8 @@ def save_active_resume_record(
             )
             new_record = dict(cur.fetchone())
 
-            # 3. Clear old matches and profiles
+            # 3. Clear old matches so fresh ones are computed for new resume
             cur.execute("DELETE FROM public.matches WHERE user_id = %s;", (user_id,))
-            cur.execute("DELETE FROM public.profiles WHERE user_id = %s;", (user_id,))
 
             conn.commit()
 
@@ -141,3 +141,70 @@ def delete_active_resume_record(user_id: str) -> Optional[str]:
             conn.commit()
 
     return old_storage_path
+
+
+def save_candidate_profile(
+    user_id: str,
+    headline: Optional[str],
+    skills: List[str],
+    experience_years: float,
+    preferred_roles: List[str],
+    raw_json: Dict[str, Any],
+    embedding: Optional[List[float]] = None,
+    content_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Atomic upsert of candidate profile attributes, vector embedding, content hash, and dynamic raw_json."""
+    emb_val = str(embedding) if embedding else None
+
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO public.profiles (
+                    user_id, headline, skills, experience_years, preferred_roles,
+                    embedding, content_hash, raw_json, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    headline = EXCLUDED.headline,
+                    skills = EXCLUDED.skills,
+                    experience_years = EXCLUDED.experience_years,
+                    preferred_roles = EXCLUDED.preferred_roles,
+                    embedding = EXCLUDED.embedding,
+                    content_hash = EXCLUDED.content_hash,
+                    raw_json = EXCLUDED.raw_json,
+                    updated_at = now()
+                RETURNING user_id, headline, skills, experience_years, preferred_roles,
+                          content_hash, (embedding IS NOT NULL) AS has_embedding, raw_json, updated_at;
+                """,
+                (
+                    user_id,
+                    headline,
+                    skills,
+                    experience_years,
+                    preferred_roles,
+                    emb_val,
+                    content_hash,
+                    json.dumps(raw_json),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row)
+
+
+def get_candidate_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve structured candidate profile from Supabase."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, headline, skills, experience_years, preferred_roles,
+                       content_hash, embedding, (embedding IS NOT NULL) AS has_embedding,
+                       raw_json, updated_at
+                FROM public.profiles
+                WHERE user_id = %s;
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None

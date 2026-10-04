@@ -2,6 +2,11 @@ from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.auth import get_current_user, AuthenticatedUser
 from app.services.document_validator import validate_document
+from app.services.resume_parser import parse_resume
+from app.services.embedding_service import (
+    build_candidate_embedding_payload,
+    resolve_candidate_embedding,
+)
 from app.services.storage import (
     upload_resume_to_storage,
     delete_resume_from_storage,
@@ -11,6 +16,8 @@ from app.core.db import (
     get_active_resume_record,
     save_active_resume_record,
     delete_active_resume_record,
+    save_candidate_profile,
+    get_candidate_profile,
 )
 
 app = FastAPI(title="Job Matcher API", version="0.1.0")
@@ -72,6 +79,12 @@ async def delete_active_resume(user: AuthenticatedUser = Depends(get_current_use
         "message": "Active resume and associated matches purged successfully",
     }
 
+@app.get("/profiles/me")
+def get_my_profile(user: AuthenticatedUser = Depends(get_current_user)):
+    """Fetch user's parsed candidate profile from Supabase."""
+    profile = get_candidate_profile(user.id)
+    return {"profile": profile}
+
 @app.post("/resumes/upload")
 async def upload_resume(
     file: UploadFile = File(...),
@@ -79,7 +92,10 @@ async def upload_resume(
 ):
     """
     Uploads a new resume.
-    If the user already has an active resume, replaces it and cleans up the previous file.
+    1. Validates document (magic bytes, size, format).
+    2. Uploads to Supabase Private Storage.
+    3. Saves active resume record in DB.
+    4. Deterministically parses sections, skills, experience, and stores profile.
     """
     content = await file.read()
 
@@ -109,6 +125,50 @@ async def upload_resume(
     if old_storage_path and old_storage_path != storage_path:
         await delete_resume_from_storage(old_storage_path)
 
+    # 5. Deterministic Resume Parsing & Profile Structuring
+    parsed = parse_resume(
+        content=doc.raw_bytes,
+        mime_type=doc.content_type,
+        filename=original_name,
+    )
+
+    # 6. Candidate Embedding Synthesis & Content Hash Cache Check
+    existing_profile = get_candidate_profile(user.id)
+    existing_hash = existing_profile.get("content_hash") if existing_profile else None
+    existing_emb = existing_profile.get("embedding") if existing_profile else None
+
+    payload_text = build_candidate_embedding_payload(
+        headline=parsed.headline,
+        preferred_roles=parsed.preferred_roles,
+        skills=parsed.skills,
+        full_time_experience_years=parsed.full_time_experience_years,
+        internship_months=parsed.internship_months,
+    )
+
+    embedding, content_hash, is_cache_hit = resolve_candidate_embedding(
+        payload_text=payload_text,
+        existing_hash=existing_hash,
+        existing_embedding=existing_emb,
+    )
+
+    profile_record = save_candidate_profile(
+        user_id=user.id,
+        headline=parsed.headline,
+        skills=parsed.skills,
+        experience_years=parsed.full_time_experience_years,
+        preferred_roles=parsed.preferred_roles,
+        raw_json={
+            "detected_headings": parsed.detected_headings,
+            "sections": parsed.sections,
+            "markdown": parsed.markdown,
+            "full_time_experience_years": parsed.full_time_experience_years,
+            "internship_months": parsed.internship_months,
+            "is_fresher": parsed.is_fresher,
+        },
+        embedding=embedding,
+        content_hash=content_hash,
+    )
+
     return {
         "success": True,
         "active": {
@@ -116,6 +176,19 @@ async def upload_resume(
             "filename": new_record["filename"],
             "file_size": new_record["file_size"],
             "storage_path": storage_path,
+        },
+        "profile": {
+            "headline": parsed.headline,
+            "skills": parsed.skills,
+            "experience_years": parsed.full_time_experience_years,
+            "full_time_experience_years": parsed.full_time_experience_years,
+            "internship_months": parsed.internship_months,
+            "is_fresher": parsed.is_fresher,
+            "preferred_roles": parsed.preferred_roles,
+            "sections_count": len(parsed.sections),
+            "content_hash": content_hash,
+            "is_cache_hit": is_cache_hit,
+            "has_embedding": True,
         },
         "characters_extracted": len(doc.extracted_text),
     }
