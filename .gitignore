@@ -26,3 +26,11 @@ scripts/spike/data/
 scripts/seed/big_*.json
 scripts/seed/pool_*.txt
 
+scripts
+.agents
+*.md
+!architecture.md
+!README.md
+!readme.md
+
+
