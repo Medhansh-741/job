@@ -1,17 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
-const FASTAPI_URL = process.env.FASTAPI_BACKEND_URL || "http://127.0.0.1:8000";
+function getFastApiBaseUrl(): string {
+  let url = (process.env.FASTAPI_BACKEND_URL || "http://127.0.0.1:8000").trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = `https://${url}`;
+  }
+  return url.replace(/\/+$/, "");
+}
 
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>
 ) {
+  let targetUrl = "";
   try {
     const resolvedParams = await params;
     const path = resolvedParams.path ? resolvedParams.path.join("/") : "";
     const search = request.nextUrl.search;
-    const targetUrl = `${FASTAPI_URL}/${path}${search}`;
+    const baseUrl = getFastApiBaseUrl();
+    const cleanPath = path.replace(/^\/+/, "");
+    targetUrl = cleanPath ? `${baseUrl}/${cleanPath}${search}` : `${baseUrl}${search}`;
 
     // Prepare headers for upstream FastAPI
     const headers = new Headers();
@@ -69,7 +78,7 @@ async function proxyRequest(
       headers: responseHeaders,
     });
   } catch (error) {
-    console.error("Proxy error:", error);
+    console.error(`Proxy error forwarding to ${targetUrl}:`, error);
     return NextResponse.json(
       { error: "Backend proxy service unavailable" },
       { status: 503 }
