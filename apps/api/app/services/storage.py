@@ -11,7 +11,10 @@ if ROOT_ENV.exists():
 else:
     load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://uefisekynsvefbcvaivb.supabase.co").rstrip("/")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+if not SUPABASE_URL:
+    # No default on purpose: a silent fallback would send resumes to the wrong project.
+    raise RuntimeError("SUPABASE_URL is not set. Add it to .env (see .env.example).")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 

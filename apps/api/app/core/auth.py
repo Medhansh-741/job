@@ -15,7 +15,10 @@ if ROOT_ENV.exists():
 else:
     load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://uefisekynsvefbcvaivb.supabase.co")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+if not SUPABASE_URL:
+    # No default on purpose: a silent fallback would point authentication at the wrong project.
+    raise RuntimeError("SUPABASE_URL is not set. Add it to .env (see .env.example).")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 
 # Supabase modern projects use ES256/RS256 asymmetric keys via JWKS
