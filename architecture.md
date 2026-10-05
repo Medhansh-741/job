@@ -349,8 +349,10 @@ When a candidate profile is matched, Stage 1 performs dense approximate nearest 
 |         )                                                                               |
 |     )                                                                                   |
 |                                                                                         |
-|  4. Regional Partition Expansion:                                                       |
+|  4. Regional Partition Expansion & Negative Geographic Knockout:                        |
 |     - Target 'india'  => Matches j.region IN ('india', 'remote')                         |
+|                          AND NOT restricted to non-India locations/timezones:            |
+|                          (location ~* '\y(amer|us only|canada|uk|france|germany|emea)\y')|
 |     - Target 'us'     => Matches j.region IN ('us', 'remote')                            |
 |     - Target 'remote' => Matches j.region = 'remote'                                    |
 |                                                                                         |
@@ -370,7 +372,7 @@ When a candidate profile is matched, Stage 1 performs dense approximate nearest 
 
 ## 7. Stage 2: Deterministic Hybrid Mathematical Scoring Layer
 
-Stage 2 takes the vector search results and evaluates them with a deterministic mathematical scoring formula. This eliminates the "single-skill fluke" anomaly (where a terse job description containing only one skill scored 90%+) by introducing a Bayesian Denominator Floor and a Non-Linear Reality Dampener.
+Stage 2 takes the vector search results and evaluates them with a deterministic mathematical scoring formula. This eliminates the "single-skill fluke" anomaly (where a terse job description containing only one skill scored 90%+) by introducing a Bayesian Denominator Floor, a Dual-Track Math Safeguard, and a Non-Linear Reality Dampener.
 
 ### Mathematical Scoring Architecture Diagram
 
@@ -395,16 +397,18 @@ Stage 2 takes the vector search results and evaluates them with a deterministic 
                                              |
                                              v
 +-----------------------------------------------------------------------------------------+
-| 2. BAYESIAN DENOMINATOR FLOOR SKILL COVERAGE                                            |
-|    Prevents 1-skill JDs from generating 100% recall.                                    |
+| 2. DUAL-TRACK MATH SAFEGUARD & BAYESIAN DENOMINATOR FLOOR                               |
 |                                                                                         |
-|    matched_skills = candidate_skills ∩ job_skills                                       |
-|    missing_skills = job_skills - candidate_skills                                       |
+|    Track A: Standard Jobs (|job_skills| > 0)                                            |
+|    - matched_skills = candidate_skills ∩ job_skills                                     |
+|    - denominator    = max(|job_skills|, 3)                                              |
+|    - C_skill        = |matched_skills| / denominator                                    |
+|    - Base_Score     = 0.40 * S_norm + 0.60 * C_skill + B_title                          |
 |                                                                                         |
-|    denominator = max(|job_skills|, 3)                                                   |
-|    C_skill     = |matched_skills| / denominator                                         |
-|                                                                                         |
-|    (Dynamic Fallback: If |job_skills| == 0, C_skill defaults to S_norm)                 |
+|    Track B: Terse / Empty-Skill Postings (|job_skills| == 0)                             |
+|    - Purely semantic track with strict score ceiling:                                   |
+|    - Base_Score = 0.70 * S_norm + B_title                                               |
+|    - Final Score is strictly capped at 65% max (68% blended ceiling)                     |
 +-----------------------------------------------------------------------------------------+
                                              |
                                              v
@@ -438,14 +442,15 @@ Stage 2 takes the vector search results and evaluates them with a deterministic 
 +-----------------------------------------------------------------------------------------+
                                              |
                                              v
-                        Sorted & Truncated to Top 15 Finalists
+               Sorted & Truncated to Top 15 Finalists with Company Diversity Cap
+                 (Strict maximum of 2 postings per employer to prevent feed spam)
 ```
 
 ---
 
 ## 8. Stage 3: Grounded Groq LLM Cross-Attention Re-Ranking
 
-The Top 15 finalists from deterministic math scoring are passed to Groq (`llama-3.3-70b-versatile` or `gpt-oss-120b`) in a single listwise batch prompt (RankGPT paradigm). The LLM evaluates candidate projects and verified skills against each job's structured schema, outputting grounded verdicts and transparent score deductions.
+The Top 15 finalists from deterministic math scoring are passed to Groq (`openai/gpt-oss-20b` primary with `openai/gpt-oss-120b` fallback) in a single listwise batch prompt (RankGPT paradigm). The LLM evaluates candidate projects and verified skills against each job's structured schema, outputting grounded verdicts and transparent score deductions in $<2\text{s}$.
 
 ### LLM Cross-Attention Pipeline Diagram
 
@@ -464,8 +469,9 @@ The Top 15 finalists from deterministic math scoring are passed to Groq (`llama-
 +-----------------------------------------------------------------------------------------+
 |                             LISTWISE BATCH PROMPT TO GROQ                               |
 |                                                                                         |
-|  - Singleton HTTP/2 Client with keep-alive to api.groq.com                              |
-|  - Parameters: max_tokens = 8000, temperature = 0.1, response_format = json_object      |
+|  - Persistent HTTP client with keep-alive & 35s timeout to api.groq.com                 |
+|  - Model: openai/gpt-oss-20b (~1.2s latency) with openai/gpt-oss-120b fallback           |
+|  - Parameters: max_tokens = 4096, temperature = 0.0, response_format = json_object      |
 |                                                                                         |
 |  STRICT SYSTEM CONTRACT:                                                                |
 |  1. Grounded Citation Mandate: In every 'verdict', you MUST cite at least one specific |
@@ -568,10 +574,20 @@ To eliminate the operational complexity and cost of external task queues (such a
 |                                  v                                      |
 |  +-------------------------------------------------------------------+  |
 |  | execute_matching_funnel(user_id, region, limit=15)                |  |
-|  | - Executes Stage 1 -> Stage 2 -> Stage 3                         |  |
+|  | - Updates thread-safe TaskTracker across 6 real-time milestones:  |  |
+|  |   10% Doc Ingestion -> 25% Parsing -> 55% Vector -> 70% Math      |  |
+|  |   -> 82% LLM Re-rank -> 95% Persistence -> 100% Complete          |  |
 |  | - Atomically writes results to public.matches                     |  |
 |  | - Releases semaphore & removes user_id from in-flight set        |  |
 |  +-------------------------------------------------------------------+  |
++-------------------------------------------------------------------------+
+                                   |
+                                   v  (Polled every 800ms by Next.js client)
++-------------------------------------------------------------------------+
+| LIVE TASK PROGRESS TRACKER (app.core.task_tracker.py)                   |
+| - Authenticated endpoint: GET /matches/status                           |
+| - Response: { status, progress, step_label, error, updated_at }         |
+| - Powers locked modal progress bar and eliminates UI race conditions    |
 +-------------------------------------------------------------------------+
 ```
 

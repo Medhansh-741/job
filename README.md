@@ -1,6 +1,6 @@
 <div align="center">
 
-# Job Matcher Engine 🎯
+# Job Matcher Engine 
 **Production-Grade, Zero-Hallucination Semantic Job Matching & Grounded Verification Platform**
 
 *Engineered for Early-Career Engineers, Freshers, and Technical Talent*
@@ -19,7 +19,7 @@
 
 ---
 
-## 📖 Executive Overview
+# Executive Overview
 
 **Job Matcher** is a full-stack, enterprise-grade job matching and candidate evaluation engine designed to solve the two biggest flaws in modern AI job search tools:
 1. **Senior Job Leakage for Freshers:** Most ATS platforms omit explicit year requirements in job postings, causing senior, lead, architect, and director roles to flood early-career candidate feeds. Job Matcher eliminates this completely via an exact **SQL-layer regex knockout barrier**.
@@ -27,22 +27,25 @@
 
 ---
 
-## ⚡ Key Highlights & Core Differentiators
+# Key Highlights & Core Differentiators
 
-- 🛡️ **SQL-Layer Seniority Knockout Barrier:** Stored procedure (`match_jobs`) on Supabase PostgreSQL applies a strict database-level regex barrier excluding `senior|sr|lead|architect|manager|staff|principal|director|vp|head of` titles whenever a fresher profile is evaluated.
-- 📐 **Bayesian Denominator Floor:** Replaces naive Jaccard recall with $\frac{|\text{Matches}|}{\max(|\text{Job Skills}|, 3)}$, permanently curing the single-skill terse JD anomaly.
-- 💥 **Non-Linear Reality Dampener:** If a candidate possesses 0% of the required explicit tools on a multi-skill job, a non-linear $0.35\times$ knockout penalty is applied, preventing high-similarity semantic illusions.
-- 🔍 **Sub-Millisecond Structured JD Parsing:** Deterministic section parser (`jd_parser.py`) extracts `responsibilities`, `required_skills`, `preferred_skills`, `experience_level`, and `education` in $<1\text{ms}$ without LLM overhead.
-- 🤖 **Zero-Hallucination Grounded Citations:** Groq LLM re-ranker operates under an immutable system contract requiring every verdict to cite concrete candidate projects (e.g. *RailMind*, *JanSamadhan*, *QMax*) and contrast them with explicit JD requirements.
-- ⚖️ **Deterministic Python Score Blending:** Prevents LLM arithmetic inaccuracies by calculating calibrated scores in Python:  
+-  **SQL-Layer Seniority Knockout Barrier:** Stored procedure (`match_jobs`) on Supabase PostgreSQL applies a strict database-level regex barrier excluding `senior|sr|lead|architect|manager|staff|principal|director|vp|head of` titles whenever a fresher profile is evaluated.
+-  **Negative Geographic Knockout for India Remote:** Automatically filters out remote positions restricted to non-India regions (`AMER`, `Canada`, `UK`, `France`, `Germany`, `EMEA`, `LATAM`) from the India candidate feed.
+-  **Feed Diversity & Anti-Cannibalization:** Limits postings to a strict maximum of **2 positions per employer** in the Top 15 finalists, eliminating feed domination by high-volume job aggregators or duplicate clones.
+-  **Bayesian Denominator Floor & Dual-Track Math Safeguard:** Replaces naive Jaccard recall with $\frac{|\text{Matches}|}{\max(|\text{Job Skills}|, 3)}$. Jobs with empty or unparsed skills are capped at 65% (math) and 68% (blended) fit, preventing terse postings from outranking rich, verified matches.
+-  **Non-Linear Reality Dampener:** If a candidate possesses 0% of the required explicit tools on a multi-skill job, a non-linear $0.35\times$ knockout penalty is applied, preventing high-similarity semantic illusions.
+-  **Sub-Millisecond Structured JD Parsing:** Deterministic section parser (`jd_parser.py`) extracts `responsibilities`, `required_skills`, `preferred_skills`, `experience_level`, and `education` in $<1\text{ms}$ without LLM overhead.
+-  **Zero-Hallucination Grounded Citations (Groq LPU):** Blazing-fast `openai/gpt-oss-20b` re-ranker operates under an immutable system contract requiring every verdict to cite concrete candidate projects (e.g. *RailMind*, *JanSamadhan*, *QMax*) and contrast them with explicit JD requirements in $<2\text{s}$.
+-  **Deterministic Python Score Blending:** Prevents LLM arithmetic inaccuracies by calculating calibrated scores in Python:  
   $$\text{Final Score} = \text{round}(0.30 \times \text{Score}_{\text{math}} + 0.70 \times \text{Score}_{\text{llm}})$$
-- 🚀 **In-Process Async Worker with Concurrency Shield:** Embedded `asyncio.Queue` with `asyncio.Semaphore(2)` throttling and in-flight deduplication. Zero Redis, Zero Celery, Zero infrastructure bloat.
-- 🌐 **On-Demand Live Search Fallback:** Automatically triggers Adzuna & Jooble India API live queries whenever a candidate's high-confidence catalog matches drop below threshold.
-- 💎 **Modern, Cognitive-Fatigue-Free Dashboard:** Streamlined UI with Two-Tier Badges (**Emerald Exact Match** vs **Zinc Broader Fit**), green strength pills, greyed-out dashed gap pills, and itemized deductions.
+-  **Live Synchronized Progress Bar & Locked Modal:** Modal locks interactions (blocks outside clicks, traps `Escape`, disables close) while real-time task tracker short-polls backend milestones (10% $\to$ 25% $\to$ 40% $\to$ 55% $\to$ 70% $\to$ 82% $\to$ 95% $\to$ 100%) through Next.js proxy with zero timeout risk.
+-  **In-Process Async Worker with Concurrency Shield:** Embedded `asyncio.Queue` with `asyncio.Semaphore(2)` throttling, thread-safe `TaskTracker`, and in-flight deduplication. Zero Redis, Zero Celery, Zero infrastructure bloat.
+-  **On-Demand Live Search Fallback:** Automatically triggers Adzuna & Jooble India API live queries with on-the-fly LLM skill extraction whenever a candidate's high-confidence catalog matches drop below threshold.
+-  **Modern, Cognitive-Fatigue-Free Dashboard:** Streamlined UI with Two-Tier Badges (**Emerald Exact Match** vs **Zinc Broader Fit**), green strength pills, greyed-out dashed gap pills, and itemized deductions.
 
 ---
 
-## 🏗️ System Architecture at a Glance
+## System Architecture at a Glance
 
 ```
  [User Resume Upload]
@@ -82,11 +85,11 @@
 | Persist & Render UI   | -> Top 15 Matches, Emerald/Zinc Badges, Grounded Modal
 +-----------------------+
 ```
-> 📄 For exhaustive architectural diagrams of every subsystem, see [architecture.md](architecture.md).
+>  For exhaustive architectural diagrams of every subsystem, see [architecture.md](architecture.md).
 
 ---
 
-## 🗂️ Monorepo Directory Layout
+## Monorepo Directory Layout
 
 ```
 .
@@ -96,15 +99,17 @@
 │   │   │   ├── core/
 │   │   │   │   ├── auth.py           # Supabase JWT decoding, validation & user context
 │   │   │   │   ├── db.py             # Psycopg2 connection pool & repository queries
+│   │   │   │   ├── task_tracker.py   # In-memory thread-safe live funnel progress tracker
 │   │   │   │   └── worker.py         # In-process asyncio queue worker & semaphore shield
 │   │   │   ├── services/
 │   │   │   │   ├── catalog_normalizer.py   # Job normalization, tokenization & deduping
 │   │   │   │   ├── document_validator.py   # 5-layer document security verification
 │   │   │   │   ├── embedding_service.py    # FastEmbed ONNX embeddings & cache hashing
 │   │   │   │   ├── jd_parser.py            # Sub-ms regex JD section parsing engine
-│   │   │   │   ├── live_fallback.py        # Live Adzuna / Jooble search fallback
-│   │   │   │   ├── llm_reranker.py         # Groq listwise cross-attention re-ranker
-│   │   │   │   ├── matching_engine.py      # Two-stage matching pipeline & hybrid math
+│   │   │   │   ├── live_fallback.py        # Live Adzuna / Jooble search fallback + on-the-fly LLM skills
+│   │   │   │   ├── llm_reranker.py         # Groq listwise cross-attention re-ranker (gpt-oss-20b)
+│   │   │   │   ├── matching_engine.py      # Two-stage matching pipeline, dual-track math & diversity cap
+│   │   │   │   ├── profile_enricher.py     # Systematic LLM profile & target role inference
 │   │   │   │   ├── resume_parser.py        # Deterministic resume parsing & tenure math
 │   │   │   │   └── storage.py              # Supabase private storage integration
 │   │   │   └── main.py               # FastAPI entry point, lifespan, & HTTP routes
@@ -122,17 +127,18 @@
 │       │           ├── active-resume-card.tsx  # Resume status, replacement & deletion
 │       │           ├── job-card.tsx            # Ranked match card with Two-Tier badges
 │       │           ├── job-modal.tsx           # Grounded verdict, strengths & gaps modal
-│       │           ├── matches-feed.tsx        # Filterable Top 15 matches feed
-│       │           ├── navbar.tsx              # Application header & user identity
+│       │           ├── upload-modal.tsx        # Locked modal with live synchronized progress bar
+│       │           ├── sidebar.tsx             # Responsive collateral navigation sidebar
 │       │           └── resume-dropzone.tsx     # Drag-and-drop resume upload zone
 │       ├── package.json              # Web dependencies
 │       └── tsconfig.json             # TypeScript compiler configuration
 │
 ├── scripts/                          # Data, migration, and verification utilities
 │   ├── migrate.py                    # Supabase PostgreSQL schema, HNSW index & RPCs
+│   ├── migrate_match_jobs.py         # PostgreSQL stored procedure migration with negative geo knockout
+│   ├── backfill_job_skills_llm.py    # Asynchronous Groq skill extraction backfiller
 │   ├── test_matching_engine.py       # 16-suite non-rubber-stamp automated test runner
 │   ├── recompute_palak_matches.py    # Match calibration verification script
-│   ├── backfill_job_skills.py        # Catalog skill extraction backfiller
 │   └── crawler/                      # ATS scraper modules (Greenhouse, Lever, Ashby)
 │
 ├── architecture.md                   # Explicit system architecture & ASCII diagrams
@@ -143,7 +149,7 @@
 
 ---
 
-## 🛠️ Tech Stack & Dependencies
+## Tech Stack & Dependencies
 
 ### Application Layer
 - **Backend API:** [FastAPI](https://fastapi.tiangolo.com/) (0.110+) running on [Uvicorn](https://www.uvicorn.org/) with asynchronous event loops.
@@ -159,7 +165,7 @@
 
 ---
 
-## 🚀 Quickstart & Local Setup Guide
+# Quickstart & Local Setup Guide
 
 ### 1. Prerequisites
 - **Python:** Version `3.11` or higher
@@ -271,7 +277,7 @@ Frontend will be available at: `http://localhost:3000`.
 
 ---
 
-## 🔌 API Reference & Specifications
+# API Reference & Specifications
 
 All user endpoints require a valid Supabase JWT bearer token passed in the `Authorization` header:  
 `Authorization: Bearer <SUPABASE_JWT_TOKEN>`
@@ -371,7 +377,7 @@ curl -X GET "http://localhost:8000/matches?region=india&limit=15" \
 
 ---
 
-## 🧮 Matching Engine Math & Grounding Rubric
+# Matching Engine Math & Grounding Rubric
 
 ### 1. Stage 1: pgvector Distance & Seniority Knockout
 - Cosine Distance: $D = j.\text{embedding} \Leftrightarrow \text{query\_embedding}$
@@ -406,7 +412,7 @@ Groq evaluates Top 15 finalists in a listwise batch prompt (`max_tokens: 8000`, 
 
 ---
 
-## 🧪 Comprehensive Automated Verification Suite
+# Comprehensive Automated Verification Suite
 
 The repository contains an exhaustive 16-suite non-rubber-stamp integration test runner covering edge cases, math clamping, Bayesian floors, reality dampeners, SQL seniority knockouts, and real PDF resumes.
 
@@ -440,7 +446,7 @@ python scripts/test_matching_engine.py
 
 ---
 
-## 🔒 Security Model & Isolation
+# Security Model & Isolation
 
 1. **Row-Level Security (RLS):** All user tables (`resumes`, `profiles`, `matches`) enforce PostgreSQL RLS policies checking `auth.uid() = user_id`. Cross-user access is impossible at the database engine level.
 2. **Private Storage Isolation:** Candidate documents are stored in private Supabase Storage buckets under `resumes/{user_id}/{safe_filename}`. Download URLs are pre-signed with short 15-minute expirations.
@@ -449,7 +455,7 @@ python scripts/test_matching_engine.py
 
 ---
 
-## 🚢 Deployment Architecture
+# Deployment Architecture
 
 | Component | Target Host | Tier / Details |
 |---|---|---|
@@ -461,6 +467,6 @@ python scripts/test_matching_engine.py
 
 ---
 
-## 📄 License
+# License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
