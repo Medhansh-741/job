@@ -10,9 +10,13 @@ Implements Step 4 specifications:
    - Base Score = 0.40 * S_norm + 0.60 * C_skill + B_title
    - D_skill = Non-Linear Reality Dampener (0.35x knockout penalty for 0% skill overlap)
    - Final Score = round(clamp(Base Score * D_skill * 100, 0, 100))
-4. Stage 4: Automated Adzuna/Jooble live fallback trigger when high-confidence matches < 10.
-5. Stage 5: Top 25 sorting and atomic public.matches database persistence.
+4. Stage 4: Adzuna/Jooble live fallback, only when the catalog returns fewer than 10 candidate rows.
+5. Stage 5: Diversity-constrained candidate pool (best math score first).
+6. Stage 6: LLM explains the top 12 (one call, cached per resume version), top-up if short; only explained
+   jobs are visible (max 10). Unexplained ones are stored hidden (llm_pending) and retried by the worker.
+7. Atomic public.matches persistence.
 """
+import asyncio
 import os
 import re
 import json
@@ -30,6 +34,16 @@ from app.services.llm_reranker import rerank_finalists_with_llm
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set in .env")
+
+DISPLAY_LIMIT = 10          # jobs shown to the user (all LLM-explained)
+INITIAL_EVAL_EXTRA = 2      # evaluate DISPLAY_LIMIT + 2 in the first LLM call
+CANDIDATE_POOL_MIN = 20     # ordered pool so a top-up has next-ranked jobs to draw from
+LIVE_FALLBACK_MIN_ROWS = 10 # live fallback only when the catalog returns fewer rows than this
+
+
+def should_trigger_live_fallback(catalog_row_count: int, preferred_roles: List[str]) -> bool:
+    """Live Adzuna/Jooble search only when the DB gave fewer than 10 candidate rows."""
+    return catalog_row_count < LIVE_FALLBACK_MIN_ROWS and bool(preferred_roles)
 
 # Recognized title tokens for title alignment boost
 ROLE_TOKENS = [
@@ -158,54 +172,8 @@ def score_job(
     }
 
 
-async def execute_matching_funnel(
-    user_id: str,
-    target_region: str = "india",
-    limit: int = 15,
-) -> Dict[str, Any]:
-    """Orchestrates the entire 5-stage matching funnel for a candidate."""
-    # 1. Fetch candidate profile
-    profile = get_candidate_profile(user_id)
-    if not profile:
-        return {
-            "matches": [],
-            "total_evaluated": 0,
-            "live_fallback_triggered": False,
-            "message": "Candidate profile not found. Please upload a resume first.",
-        }
-
-    candidate_skills = profile.get("skills") or []
-    if not candidate_skills:
-        return {
-            "matches": [],
-            "total_evaluated": 0,
-            "live_fallback_triggered": False,
-            "message": "No technical skills detected in profile. Please add skills or upload a technical resume.",
-        }
-
-    embedding = profile.get("embedding")
-    if not embedding:
-        return {
-            "matches": [],
-            "total_evaluated": 0,
-            "live_fallback_triggered": False,
-            "message": "Resume embedding is being generated. Please retry in a few seconds.",
-        }
-
-    raw_json = profile.get("raw_json") or {}
-    is_fresher = raw_json.get("is_fresher", True)
-    full_time_years = profile.get("experience_years") or 0.0
-    preferred_roles = profile.get("preferred_roles") or []
-    headline = profile.get("headline")
-
-    task_tracker.set_progress(
-        user_id,
-        status="processing",
-        progress=55,
-        step_label="Scanning 1,000+ jobs via vector search & regional filters...",
-    )
-
-    # 2. Stage 1 & Stage 2: Query PostgreSQL match_jobs stored procedure (K = 100)
+def _fetch_catalog_rows(embedding: Any, target_region: str, full_time_years: float, is_fresher: bool) -> List[Dict[str, Any]]:
+    """Blocking: Stage 1 & 2 vector retrieval via the match_jobs stored procedure (K = 100)."""
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -229,7 +197,91 @@ async def execute_matching_funnel(
                     is_fresher,
                 )
             )
-            catalog_rows = cur.fetchall()
+            return cur.fetchall()
+
+
+def _persist_matches(user_id: str, rows: List[Dict[str, Any]]) -> None:
+    """Blocking: atomically replaces the user's matches (explained + hidden pending rows)."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.matches WHERE user_id = %s;", (user_id,))
+            insert_rows = [
+                (
+                    user_id,
+                    m["id"],
+                    m["match_score"],
+                    m["matched_skills"],
+                    m["missing_skills"],
+                    m.get("explanation"),
+                    json.dumps(m.get("score_breakdown") or {}),
+                )
+                for m in rows
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO public.matches (
+                    user_id, job_id, match_score, matched_skills, missing_skills, explanation, score_breakdown
+                ) VALUES %s
+                ON CONFLICT (user_id, job_id) DO UPDATE SET
+                    match_score = EXCLUDED.match_score,
+                    matched_skills = EXCLUDED.matched_skills,
+                    missing_skills = EXCLUDED.missing_skills,
+                    explanation = EXCLUDED.explanation,
+                    score_breakdown = EXCLUDED.score_breakdown,
+                    created_at = now();
+                """,
+                insert_rows,
+            )
+        conn.commit()
+
+
+def _early_exit(user_id: str, message: str) -> Dict[str, Any]:
+    task_tracker.mark_failed(user_id, message)
+    return {
+        "matches": [],
+        "total_evaluated": 0,
+        "live_fallback_triggered": False,
+        "message": message,
+    }
+
+
+async def execute_matching_funnel(
+    user_id: str,
+    target_region: str = "india",
+    limit: int = DISPLAY_LIMIT,
+) -> Dict[str, Any]:
+    """Orchestrates the matching funnel for a candidate. Blocking DB work runs off the event loop."""
+    limit = max(1, min(limit, DISPLAY_LIMIT))
+
+    # 1. Fetch candidate profile
+    profile = await asyncio.to_thread(get_candidate_profile, user_id)
+    if not profile:
+        return _early_exit(user_id, "Candidate profile not found. Please upload a resume first.")
+
+    candidate_skills = profile.get("skills") or []
+    if not candidate_skills:
+        return _early_exit(user_id, "No technical skills detected in profile. Please add skills or upload a technical resume.")
+
+    embedding = profile.get("embedding")
+    if not embedding:
+        return _early_exit(user_id, "Resume embedding is being generated. Please retry in a few seconds.")
+
+    raw_json = profile.get("raw_json") or {}
+    is_fresher = raw_json.get("is_fresher", True)
+    full_time_years = profile.get("experience_years") or 0.0
+    preferred_roles = profile.get("preferred_roles") or []
+    headline = profile.get("headline")
+
+    task_tracker.set_progress(
+        user_id,
+        status="processing",
+        progress=55,
+        step_label="Scanning 1,000+ jobs via vector search & regional filters...",
+    )
+
+    # 2. Stage 1 & Stage 2: vector retrieval (K = 100)
+    catalog_rows = await asyncio.to_thread(_fetch_catalog_rows, embedding, target_region, full_time_years, is_fresher)
 
     # 3. Stage 3: Deterministic Hybrid Scoring & Reality Dampening
     task_tracker.set_progress(
@@ -253,6 +305,8 @@ async def execute_matching_funnel(
             "id": r["id"],
             "title": r["title"],
             "company": r["company"],
+            "normalized_company": r.get("normalized_company"),
+            "normalized_title": r.get("normalized_title"),
             "location": r["location"],
             "region": r["region"],
             "description": r["description"],
@@ -263,20 +317,17 @@ async def execute_matching_funnel(
             **audit,
         })
 
-    # 4. Stage 4: Live Fallback Check (Adzuna / Jooble)
-    strong_matches_count = sum(1 for j in scored_jobs if j["match_score"] >= 60)
+    # 4. Stage 4: Live Fallback (Adzuna / Jooble) only when the catalog returned < 10 rows
     live_fallback_triggered = False
-
-    if strong_matches_count < 10 and preferred_roles:
+    if should_trigger_live_fallback(len(catalog_rows), preferred_roles):
         live_fallback_triggered = True
-        role_to_query = preferred_roles[0]
-        live_jobs = await execute_live_fallback_search(role_to_query, region=target_region)
+        live_jobs = await execute_live_fallback_search(preferred_roles[0], region=target_region)
 
-        # Score net-new live jobs
+        known_ids = {j["id"] for j in scored_jobs}
         for lj in live_jobs:
-            # Avoid duplicate ids
-            if any(existing["id"] == lj["id"] for existing in scored_jobs):
+            if lj["id"] in known_ids:
                 continue
+            known_ids.add(lj["id"])
 
             audit = score_job(
                 raw_sim=lj.get("similarity", 0.65),
@@ -291,6 +342,8 @@ async def execute_matching_funnel(
                 "id": lj["id"],
                 "title": lj["title"],
                 "company": lj["company"],
+                "normalized_company": lj.get("normalized_company"),
+                "normalized_title": lj.get("normalized_title"),
                 "location": lj["location"],
                 "region": lj["region"],
                 "description": lj["description"],
@@ -301,7 +354,7 @@ async def execute_matching_funnel(
                 **audit,
             })
 
-    # 5. Stage 5: Deterministic Sort & Diversity-Constrained Truncation (Top 15 Finalists)
+    # 5. Stage 5: Deterministic Sort & Diversity-Constrained candidate pool
     # Sort order: match_score DESC, date_posted DESC, id ASC
     def sort_key(item):
         score = item["match_score"]
@@ -313,9 +366,10 @@ async def execute_matching_funnel(
     # Diversity & Role-Dedup Invariant:
     # 1. At most 2 postings per company to prevent feed cannibalization.
     # 2. Strict (company, normalized_title) uniqueness so duplicate aggregator postings are skipped.
+    pool_size = max(limit + 10, CANDIDATE_POOL_MIN)
     company_counts: Dict[str, int] = {}
     seen_roles: Set[Tuple[str, str]] = set()
-    top_finalists: List[Dict[str, Any]] = []
+    candidate_pool: List[Dict[str, Any]] = []
 
     for job in scored_jobs:
         comp_key = (job.get("normalized_company") or job.get("company") or "unknown").lower().strip()
@@ -331,73 +385,59 @@ async def execute_matching_funnel(
 
         seen_roles.add(role_key)
         company_counts[comp_key] = current_count + 1
-        top_finalists.append(job)
-        if len(top_finalists) >= limit:
+        candidate_pool.append(job)
+        if len(candidate_pool) >= pool_size:
             break
 
-    # 6. Stage 4.3: Groq LLM Cross-Attention Re-Ranking & Calibration
+    # 6. Stage 6: LLM explanation (cached per resume version). Only explained jobs become visible.
     task_tracker.set_progress(
         user_id,
         status="processing",
         progress=82,
-        step_label="Cross-attention LLM evaluating top 15 finalists...",
+        step_label="AI is evaluating your best matches...",
     )
-    calibrated_matches = await rerank_finalists_with_llm(
+    outcome = await rerank_finalists_with_llm(
         candidate_profile=profile,
-        finalists=top_finalists,
+        candidates=candidate_pool,
+        target=limit,
+        initial=limit + INITIAL_EVAL_EXTRA,
+        user_id=user_id,
+        content_hash=profile.get("content_hash"),
     )
 
-    # 7. Database Persistence to public.matches (Atomic Replace)
+    # 7. Persistence (atomic replace): explained rows are visible, pending rows are hidden until explained
     task_tracker.set_progress(
         user_id,
         status="processing",
         progress=95,
         step_label="Calibrating scores and saving matches...",
     )
-    if calibrated_matches:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                # Atomically purge old matches for this user before saving calibrated finalists
-                cur.execute("DELETE FROM public.matches WHERE user_id = %s;", (user_id,))
-                insert_rows = [
-                    (
-                        user_id,
-                        m["id"],
-                        m["match_score"],
-                        m["matched_skills"],
-                        m["missing_skills"],
-                        m.get("explanation"),
-                        json.dumps(m.get("score_breakdown") or {}),
-                    )
-                    for m in calibrated_matches
-                ]
-                insert_sql = """
-                INSERT INTO public.matches (
-                    user_id, job_id, match_score, matched_skills, missing_skills, explanation, score_breakdown
-                ) VALUES %s
-                ON CONFLICT (user_id, job_id) DO UPDATE SET
-                    match_score = EXCLUDED.match_score,
-                    matched_skills = EXCLUDED.matched_skills,
-                    missing_skills = EXCLUDED.missing_skills,
-                    explanation = EXCLUDED.explanation,
-                    score_breakdown = EXCLUDED.score_breakdown,
-                    created_at = now();
-                """
-                execute_values(cur, insert_sql, insert_rows)
-            conn.commit()
+    rows_to_save = outcome.explained + outcome.pending
+    if rows_to_save:
+        await asyncio.to_thread(_persist_matches, user_id, rows_to_save)
 
-    task_tracker.mark_completed(user_id, count=len(calibrated_matches))
+    if outcome.error:
+        task_tracker.mark_failed(user_id, outcome.error)
+    elif outcome.retry_after is not None:
+        task_tracker.mark_analysis_pending(user_id, explained=len(outcome.explained), retry_in=outcome.retry_after)
+    else:
+        task_tracker.mark_completed(user_id, count=len(outcome.explained))
 
     return {
-        "matches": calibrated_matches,
+        "matches": outcome.explained,
         "total_evaluated": len(scored_jobs),
         "live_fallback_triggered": live_fallback_triggered,
-        "strong_matches_count": sum(1 for m in calibrated_matches if m["match_score"] >= 60),
+        "strong_matches_count": sum(1 for m in outcome.explained if m["match_score"] >= 60),
+        "pending_count": len(outcome.pending),
+        "retry_after": outcome.retry_after if not outcome.error else None,
     }
 
 
-def get_persisted_matches(user_id: str, limit: int = 15) -> List[Dict[str, Any]]:
-    """Fast-path retrieval of persisted matches directly from public.matches with public.jobs metadata (sub-2ms)."""
+def get_persisted_matches(user_id: str, limit: int = DISPLAY_LIMIT) -> List[Dict[str, Any]]:
+    """Fast-path retrieval of visible (LLM-explained) matches with public.jobs metadata (sub-2ms).
+
+    Rows flagged llm_pending are hidden: a job without an explanation never surfaces.
+    """
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -409,6 +449,7 @@ def get_persisted_matches(user_id: str, limit: int = 15) -> List[Dict[str, Any]]
                 FROM public.matches m
                 JOIN public.jobs j ON m.job_id = j.id
                 WHERE m.user_id = %s
+                  AND COALESCE(m.score_breakdown->>'llm_pending', 'false') <> 'true'
                 ORDER BY m.match_score DESC
                 LIMIT %s;
                 """,

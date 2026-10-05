@@ -41,7 +41,7 @@ def build_candidate_embedding_payload(
         if internship_months > 0:
             exp_str += f" with {internship_months} months internship experience"
 
-    skills_str = ", ".join(skills[:50]) if skills else "General Software Development"
+    skills_str = ", ".join(skills) if skills else "General Software Development"
     return f"Role: {role_str}. Skills: {skills_str}. Experience: {exp_str}."
 
 
@@ -61,6 +61,18 @@ def generate_embedding(text: str) -> List[float]:
     if norm == 0:
         norm = 1.0
     return [float(x / norm) for x in raw_emb]
+
+
+def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Embeds many texts in one model call; each vector is L2-normalized like generate_embedding."""
+    if not texts:
+        return []
+    model = get_embedding_model()
+    out: List[List[float]] = []
+    for raw_emb in model.embed(list(texts)):
+        norm = sum(x * x for x in raw_emb) ** 0.5 or 1.0
+        out.append([float(x / norm) for x in raw_emb])
+    return out
 
 
 def resolve_candidate_embedding(

@@ -1,3 +1,7 @@
+import asyncio
+import os
+import hashlib
+import time
 from typing import Optional
 from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,19 +24,47 @@ from app.core.db import (
     delete_active_resume_record,
     save_candidate_profile,
     get_candidate_profile,
+    clear_user_matches,
+    candidate_ready,
 )
 from app.core.worker import matching_worker, lifespan
 from app.core.task_tracker import task_tracker
-from app.services.matching_engine import execute_matching_funnel, get_persisted_matches
+from app.services.matching_engine import get_persisted_matches, DISPLAY_LIMIT
+
+# After a finished run, GET /matches will not enqueue another one for this long (stops refresh loops)
+ENQUEUE_COOLDOWN_SECONDS = 60.0
+
+# Browsers reach the API only through the Next.js proxy (server-to-server, no CORS), so the default allows just
+# local dev origins. Set CORS_ORIGINS (comma-separated) if a browser app must call the API directly.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if o.strip()
+]
+
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Runs a cleanup coroutine in the background; failures are swallowed (best-effort cleanup)."""
+    async def _quiet():
+        try:
+            await coro
+        except Exception:
+            pass
+    task = asyncio.ensure_future(_quiet())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 app = FastAPI(title="Job Matcher API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,   # the API uses Bearer tokens, never cookies
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 @app.get("/health")
@@ -73,9 +105,11 @@ async def get_active_resume(user: AuthenticatedUser = Depends(get_current_user))
 async def delete_active_resume(user: AuthenticatedUser = Depends(get_current_user)):
     """
     Purges user's single active resume from DB and cloud storage.
-    Cascades to delete matches and profile so dashboard resets to empty state.
+    Cascades to delete matches, profile and cached LLM evaluations so dashboard resets to empty state.
     """
-    old_storage_path = delete_active_resume_record(user.id)
+    matching_worker.cancel_retry(user.id)
+    old_storage_path = await asyncio.to_thread(delete_active_resume_record, user.id)
+    task_tracker.clear(user.id)
     if old_storage_path:
         await delete_resume_from_storage(old_storage_path)
 
@@ -112,64 +146,75 @@ async def upload_resume(
     )
     content = await file.read()
 
-    # 1. 5-layer document validation (size, extension, magic bytes, zip bomb, readability)
+    # 1. 5-layer document validation (size, extension, magic bytes, zip bomb, readability) - CPU, off the loop
     original_name = file.filename or "resume.pdf"
-    doc = validate_document(filename=original_name, content=content)
+    doc = await asyncio.to_thread(validate_document, filename=original_name, content=content)
 
-    # 2. Persist to isolated user folder in Supabase Private Storage
-    storage_path = await upload_resume_to_storage(
-        user_id=user.id,
-        safe_filename=doc.safe_filename,
-        content=doc.raw_bytes,
-        content_type=doc.content_type,
-    )
-
-    # 3. Atomically save as active resume in DB, retrieving previous storage path if any
-    new_record, old_storage_path = save_active_resume_record(
-        user_id=user.id,
-        filename=original_name,
-        storage_path=storage_path,
-        file_size=len(doc.raw_bytes),
-        mime_type=doc.content_type,
-        raw_text=doc.extracted_text,
-    )
-
-    # 4. If replacing an existing resume, purge old file from storage
-    if old_storage_path and old_storage_path != storage_path:
-        await delete_resume_from_storage(old_storage_path)
-
-    # 5. Deterministic Resume Parsing & Profile Structuring
     task_tracker.set_progress(
         user.id,
         status="processing",
         progress=25,
         step_label="Parsing technical skills & structuring profile...",
     )
-    parsed = parse_resume(
-        content=doc.raw_bytes,
-        mime_type=doc.content_type,
-        filename=original_name,
-    )
 
-    # 5.1 Systematic LLM Profile Understanding & Target Role Inference if missing
+    # 2+5. Storage upload (network) and deterministic parsing (CPU) are independent: run them concurrently
+    upload_task = asyncio.ensure_future(upload_resume_to_storage(
+        user_id=user.id,
+        safe_filename=doc.safe_filename,
+        content=doc.raw_bytes,
+        content_type=doc.content_type,
+    ))
+    profile_task = asyncio.ensure_future(asyncio.to_thread(get_candidate_profile, user.id))  # independent of parsing
+    try:
+        parsed = await asyncio.to_thread(
+            parse_resume,
+            content=doc.raw_bytes,
+            mime_type=doc.content_type,
+            filename=original_name,
+        )
+    except Exception:
+        # Parsing failed: do not leave an orphaned file in storage
+        try:
+            _fire_and_forget(delete_resume_from_storage(await upload_task))
+        except Exception:
+            pass
+        raise
+    existing_profile = await profile_task
+    existing_raw = (existing_profile or {}).get("raw_json") or {}
+    markdown_hash = hashlib.sha256((parsed.markdown or "").encode("utf-8")).hexdigest()
+
+    # 5.1 LLM Profile Understanding & Target Role Inference, only when needed.
+    # Identical resume text with a previously LLM-derived headline/roles -> reuse them (0 tokens).
+    enriched_by_llm = True
     if not parsed.headline or not parsed.preferred_roles:
-        task_tracker.set_progress(
-            user.id,
-            status="processing",
-            progress=38,
-            step_label="Inferring engineering domain & target roles via LLM...",
+        can_reuse = bool(
+            existing_profile
+            and existing_raw.get("markdown_hash") == markdown_hash
+            and existing_raw.get("enriched_by_llm")
+            and existing_profile.get("headline")
+            and existing_profile.get("preferred_roles")
         )
-        enriched = await enrich_candidate_profile(
-            markdown=parsed.markdown,
-            skills=parsed.skills,
-        )
-        if not parsed.headline:
-            parsed.headline = enriched.get("headline")
-        if not parsed.preferred_roles:
-            parsed.preferred_roles = enriched.get("preferred_roles", [])
+        if can_reuse:
+            parsed.headline = parsed.headline or existing_profile["headline"]
+            parsed.preferred_roles = parsed.preferred_roles or existing_profile["preferred_roles"]
+        else:
+            task_tracker.set_progress(
+                user.id,
+                status="processing",
+                progress=38,
+                step_label="Inferring engineering domain & target roles via LLM...",
+            )
+            enriched = await enrich_candidate_profile(
+                markdown=parsed.markdown,
+                skills=parsed.skills,
+            )
+            enriched_by_llm = enriched.get("source") == "llm"
+            if not parsed.headline:
+                parsed.headline = enriched.get("headline")
+            if not parsed.preferred_roles:
+                parsed.preferred_roles = enriched.get("preferred_roles", [])
 
     # 6. Candidate Embedding Synthesis & Content Hash Cache Check
-    existing_profile = get_candidate_profile(user.id)
     existing_hash = existing_profile.get("content_hash") if existing_profile else None
     existing_emb = existing_profile.get("embedding") if existing_profile else None
 
@@ -181,13 +226,15 @@ async def upload_resume(
         internship_months=parsed.internship_months,
     )
 
-    embedding, content_hash, is_cache_hit = resolve_candidate_embedding(
-        payload_text=payload_text,
-        existing_hash=existing_hash,
-        existing_embedding=existing_emb,
+    embedding, content_hash, is_cache_hit = await asyncio.to_thread(
+        resolve_candidate_embedding,
+        payload_text,
+        existing_hash,
+        existing_emb,
     )
 
-    profile_record = save_candidate_profile(
+    await asyncio.to_thread(
+        save_candidate_profile,
         user_id=user.id,
         headline=parsed.headline,
         skills=parsed.skills,
@@ -197,6 +244,8 @@ async def upload_resume(
             "detected_headings": parsed.detected_headings,
             "sections": parsed.sections,
             "markdown": parsed.markdown,
+            "markdown_hash": markdown_hash,
+            "enriched_by_llm": enriched_by_llm,
             "full_time_experience_years": parsed.full_time_experience_years,
             "internship_months": parsed.internship_months,
             "is_fresher": parsed.is_fresher,
@@ -206,20 +255,45 @@ async def upload_resume(
     )
 
     # 7. Match Lifecycle Contract:
-    # If identical content hash AND user already has computed matches in DB -> bypass worker (0ms CPU, 0 tokens)
-    # If modified resume or matches missing -> enqueue background task with concurrency shield
-    existing_matches = get_persisted_matches(user.id, limit=1)
-    if is_cache_hit and existing_matches:
-        # Cache hit bypass: keep existing matches intact, 0 API tokens consumed
+    # Identical content AND a full set of explained matches already saved -> bypass worker (0 tokens).
+    # Otherwise (new/changed resume, or an incomplete earlier run) -> enqueue; cached LLM evaluations
+    # mean only jobs without an explanation are sent to Groq.
+    matching_worker.cancel_retry(user.id)
+    existing_matches = await asyncio.to_thread(get_persisted_matches, user.id, DISPLAY_LIMIT)
+    if is_cache_hit and len(existing_matches) >= DISPLAY_LIMIT:
         task_tracker.mark_completed(user.id)
     else:
+        if not is_cache_hit:
+            # Content changed: old matches and cached evaluations belong to the previous resume.
+            await asyncio.to_thread(clear_user_matches, user.id)
         task_tracker.set_progress(
             user.id,
             status="processing",
             progress=50,
             step_label="Synthesizing vector embedding & enqueueing matching funnel...",
         )
-        await matching_worker.enqueue(user_id=user.id, region="india", limit=15)
+        await matching_worker.enqueue(user_id=user.id, region="india", limit=DISPLAY_LIMIT)
+
+    # 2-4. The funnel above only needs the parsed profile, so it is already running while the file uploads.
+    # Now wait for the storage upload (started at the top) and record the resume.
+    try:
+        storage_path = await upload_task
+        new_record, old_storage_path = await asyncio.to_thread(
+            save_active_resume_record,
+            user_id=user.id,
+            filename=original_name,
+            storage_path=storage_path,
+            file_size=len(doc.raw_bytes),
+            mime_type=doc.content_type,
+            raw_text=doc.extracted_text,
+        )
+    except Exception:
+        task_tracker.mark_failed(user.id, "Could not store the resume file. Please try again.")
+        raise
+
+    # Purge the previous file from storage in the background (the response does not need to wait for it)
+    if old_storage_path and old_storage_path != storage_path:
+        _fire_and_forget(delete_resume_from_storage(old_storage_path))
 
     return {
         "success": True,
@@ -252,43 +326,67 @@ async def get_matches_status(user: AuthenticatedUser = Depends(get_current_user)
     return task_tracker.get_progress(user.id)
 
 
+def filter_matches_by_region(matches: list, region: str) -> list:
+    """Region view over the saved matches (read-only; a miss returns an empty list, never a rerun)."""
+    if region == "all":
+        return list(matches)
+    if region == "india":
+        return [m for m in matches if m.get("region") in ("india", "remote")]
+    if region == "us":
+        return [m for m in matches if m.get("region") in ("us", "remote")]
+    return [m for m in matches if m.get("region") == region]
+
+
 @app.get("/matches")
 async def get_matches(
     region: Optional[str] = Query("india", description="Target region: india, us, remote, or all"),
-    limit: Optional[int] = Query(15, ge=1, le=100, description="Max matches to return"),
+    limit: Optional[int] = Query(DISPLAY_LIMIT, ge=1, le=DISPLAY_LIMIT, description="Max matches to return"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     """
-    Returns user's top matches.
-    Fast path: returns persisted matches from public.matches (< 2ms).
-    Cold path: executes matching funnel if public.matches is empty.
+    Returns the user's explained top matches (max 10). READ-ONLY: never runs the funnel inside the request.
+
+    If nothing is saved and no run is active, a background run is enqueued through the worker
+    (deduplicated, with a cooldown) and a `processing` state is returned for the client to poll.
     """
-    persisted = get_persisted_matches(user.id, limit=limit or 15)
-    if persisted:
-        target_reg = region or "india"
-        if target_reg == "all":
-            filtered = persisted
-        elif target_reg == "india":
-            filtered = [m for m in persisted if m.get("region") in ("india", "remote")]
-        elif target_reg == "us":
-            filtered = [m for m in persisted if m.get("region") in ("us", "remote")]
-        elif target_reg == "remote":
-            filtered = [m for m in persisted if m.get("region") == "remote"]
-        else:
-            filtered = [m for m in persisted if m.get("region") == target_reg]
+    limit = limit or DISPLAY_LIMIT
+    persisted = await asyncio.to_thread(get_persisted_matches, user.id, DISPLAY_LIMIT)
+    filtered = filter_matches_by_region(persisted, region or "india")[:limit]
+    progress = task_tracker.get_progress(user.id)
 
-        if filtered:
-            return {
-                "matches": filtered[:limit],
-                "total_evaluated": len(persisted),
-                "live_fallback_triggered": False,
-                "strong_matches_count": sum(1 for m in filtered if m["match_score"] >= 60),
-            }
-
-    # Cold path: compute and persist
-    result = await execute_matching_funnel(
-        user_id=user.id,
-        target_region=region or "india",
-        limit=limit or 25,
+    busy = bool(
+        progress["status"] == "processing"
+        or progress.get("analysis_pending")
+        or matching_worker.has_scheduled_retry(user.id)
+        or user.id in matching_worker.pending_users
     )
-    return result
+
+    if not busy and not persisted:
+        age = time.time() - progress["updated_at"]
+        may_start = progress["status"] == "idle" or age > ENQUEUE_COOLDOWN_SECONDS
+        if may_start and await asyncio.to_thread(candidate_ready, user.id):
+            task_tracker.set_progress(
+                user.id,
+                status="processing",
+                progress=50,
+                step_label="Starting match analysis...",
+            )
+            await matching_worker.enqueue(user_id=user.id, region="india", limit=DISPLAY_LIMIT)
+            busy = True
+
+    if busy:
+        state = "processing"
+    elif not persisted and progress["status"] == "failed":
+        state = "failed"
+    else:
+        state = "ready"
+
+    return {
+        "matches": filtered,
+        "total_evaluated": len(persisted),
+        "live_fallback_triggered": False,
+        "strong_matches_count": sum(1 for m in filtered if m["match_score"] >= 60),
+        "status": state,
+        "analysis_pending": busy,
+        "error": progress.get("error") if state == "failed" else None,
+    }

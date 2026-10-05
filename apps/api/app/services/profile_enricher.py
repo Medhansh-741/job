@@ -1,19 +1,16 @@
 """Systematic Candidate Profile Understanding & Role Inference via Groq.
 
 Extracts holistic professional headline, primary engineering domain, and target roles
-from candidate resume markdown and verified skills. Runs once at upload time (cached in DB).
+from candidate resume markdown and verified skills. Runs only for new/changed resumes
+(the upload flow reuses the stored result when the resume text is unchanged).
+All traffic goes through the shared Groq gateway (key pool + rate limiter).
 """
-import os
-import json
-from typing import List, Dict, Any, Optional
-import httpx
-from dotenv import load_dotenv
+import logging
+from typing import List, Dict, Any
 
-load_dotenv()
+from app.services.groq_gateway import GroqError, get_gateway
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL = "openai/gpt-oss-20b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+logger = logging.getLogger("profile_enricher")
 
 PROMPT_TEMPLATE = """Analyze this candidate's resume markdown and verified skills to determine their professional identity and target engineering roles.
 Return ONLY a valid JSON object matching this schema:
@@ -29,50 +26,48 @@ Candidate Resume:
 Verified Technical Skills:
 {skills}"""
 
+DEFAULT_PROFILE = {
+    "headline": "Software Engineer",
+    "primary_domain": "software_engineering",
+    "preferred_roles": ["Software Engineer", "Full-Stack Developer"],
+}
+
+
+def _default() -> Dict[str, Any]:
+    return {**DEFAULT_PROFILE, "preferred_roles": list(DEFAULT_PROFILE["preferred_roles"]), "source": "default"}
+
 
 async def enrich_candidate_profile(markdown: str, skills: List[str]) -> Dict[str, Any]:
-    """Infers headline, primary domain, and preferred roles using Groq."""
-    if not GROQ_API_KEY or not markdown:
-        return {
-            "headline": "Software Engineer",
-            "primary_domain": "software_engineering",
-            "preferred_roles": ["Software Engineer", "Full-Stack Developer"],
-        }
+    """Infers headline, primary domain, and preferred roles using Groq.
 
-    prompt = PROMPT_TEMPLATE.format(
-        markdown=markdown[:3000],
-        skills=", ".join(skills[:30])
-    )
+    The result carries `source`: "llm" when Groq produced it, "default" for the generic fallback,
+    so callers never cache a fallback as if it were a real inference.
+    """
+    gw = get_gateway()
+    if not gw.has_keys or not markdown:
+        return _default()
+
+    prompt = PROMPT_TEMPLATE.format(markdown=markdown[:3000], skills=", ".join(skills))
 
     try:
-        from app.services.llm_reranker import get_groq_client
-        client = get_groq_client()
-        resp = await client.post(
-            GROQ_URL,
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=10.0,
+        result = await gw.chat_json(
+            [{"role": "user", "content": prompt}],
+            max_tokens=400,
+            purpose="enrich_profile",
+            max_wait=5.0,
         )
-        if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            headline = parsed.get("headline") or "Software Engineer"
-            primary_domain = parsed.get("primary_domain") or "software_engineering"
-            preferred_roles = parsed.get("preferred_roles") or ["Software Engineer", "Full-Stack Developer"]
-            return {
-                "headline": headline.strip(),
-                "primary_domain": primary_domain.strip(),
-                "preferred_roles": [r.strip() for r in preferred_roles if isinstance(r, str)],
-            }
-    except Exception as e:
-        print(f"[Profile Enricher] Error inferring profile with LLM: {e}")
+    except GroqError as exc:
+        logger.warning("profile enrichment skipped: %s", exc)
+        return _default()
 
+    parsed = result.data
+    headline = parsed.get("headline")
+    roles = [r.strip() for r in (parsed.get("preferred_roles") or []) if isinstance(r, str) and r.strip()]
+    if not isinstance(headline, str) or not headline.strip() or not roles:
+        return _default()
     return {
-        "headline": "Software Engineer",
-        "primary_domain": "software_engineering",
-        "preferred_roles": ["Software Engineer", "Full-Stack Developer"],
+        "headline": headline.strip(),
+        "primary_domain": (parsed.get("primary_domain") or "software_engineering").strip(),
+        "preferred_roles": roles,
+        "source": "llm",
     }
