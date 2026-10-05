@@ -84,9 +84,12 @@ CREATE TABLE IF NOT EXISTS public.matches (
     matched_skills TEXT[] DEFAULT '{}',
     missing_skills TEXT[] DEFAULT '{}',
     explanation TEXT,
+    score_breakdown JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT unique_user_job_match UNIQUE (user_id, job_id)
 );
+
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS score_breakdown JSONB DEFAULT '{}'::jsonb;
 
 -- 6. Indexes
 CREATE INDEX IF NOT EXISTS idx_resumes_user_id ON public.resumes(user_id);
@@ -101,14 +104,17 @@ CREATE INDEX IF NOT EXISTS idx_jobs_embedding_hnsw ON public.jobs USING hnsw (em
 CREATE OR REPLACE FUNCTION match_jobs (
     query_embedding vector(384),
     match_threshold float DEFAULT 0.0,
-    match_count int DEFAULT 50,
+    match_count int DEFAULT 100,
     filter_region text DEFAULT NULL,
-    filter_max_years int DEFAULT NULL
+    filter_max_years int DEFAULT NULL,
+    is_fresher_candidate boolean DEFAULT false
 )
 RETURNS TABLE (
     id text,
     title text,
     company text,
+    normalized_company text,
+    normalized_title text,
     location text,
     region text,
     description text,
@@ -123,11 +129,16 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 BEGIN
+    -- Explores 150 graph nodes to guarantee complete Top-100 exploration
+    PERFORM set_config('hnsw.ef_search', '150', true);
+
     RETURN QUERY
     SELECT
         j.id,
         j.title,
         j.company,
+        j.normalized_company,
+        j.normalized_title,
         j.location,
         j.region,
         j.description,
@@ -141,8 +152,34 @@ BEGIN
     WHERE j.is_active = true
       AND j.embedding IS NOT NULL
       AND (1 - (j.embedding <=> query_embedding)) >= match_threshold
-      AND (filter_region IS NULL OR filter_region = 'all' OR j.region = filter_region)
-      AND (filter_max_years IS NULL OR j.required_years IS NULL OR j.required_years <= filter_max_years)
+      -- Hard Seniority Boundary Exclusion
+      -- 1. All candidates: exclude executive/director titles
+      AND NOT (
+          j.normalized_title ~* '\y(director|vp|vice president|head of)\y'
+          OR j.title ~* '\y(director|vp|vice president|head of)\y'
+      )
+      -- 2. Freshers strictly: hard knockout of Senior, Lead, Architect, Manager, Staff, Principal
+      AND (
+          NOT is_fresher_candidate OR
+          NOT (
+              j.normalized_title ~* '\y(senior|sr\.?|lead|architect|manager|mgr|staff|principal)\y'
+              OR j.title ~* '\y(senior|sr\.?|lead|architect|manager|mgr|staff|principal)\y'
+          )
+      )
+      -- Region Invariant: 'india' includes 'remote'; 'us' includes 'remote'
+      AND (
+          filter_region IS NULL OR filter_region = 'all' OR
+          (filter_region = 'india' AND j.region IN ('india', 'remote')) OR
+          (filter_region = 'us' AND j.region IN ('us', 'remote')) OR
+          (filter_region = 'remote' AND j.region = 'remote') OR
+          (filter_region NOT IN ('india', 'us', 'remote', 'all') AND j.region = filter_region)
+      )
+      -- Experience Invariant: Freshers see <= 1 OR NULL; Experienced see <= (Y+1) OR NULL
+      AND (
+          j.required_years IS NULL OR
+          (is_fresher_candidate AND j.required_years <= 1) OR
+          (NOT is_fresher_candidate AND (filter_max_years IS NULL OR j.required_years <= (filter_max_years + 1)))
+      )
     ORDER BY j.embedding <=> query_embedding
     LIMIT match_count;
 END;
