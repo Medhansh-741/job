@@ -82,6 +82,23 @@ SKILLS_TAXONOMY = {
     "agile": ["agile", "scrum"], "system design": ["system design", "distributed systems", "scalable"],
     "algorithms": ["data structures", "algorithms", "dsa"], "oop": ["oop", "object-oriented"],
     "security": ["security", "cybersecurity", "authentication", "oauth", "jwt"],
+    # Widened coverage (common JD vocabulary that previously left jobs with no skills at all)
+    "hugging face": ["hugging face", "huggingface", "transformers"],
+    "fine-tuning": ["fine-tuning", "finetuning", "fine tuning", "lora", "rlhf"],
+    "cuda": ["cuda", "gpu programming"],
+    "mlflow": ["mlflow", "kubeflow", "sagemaker", "vertex ai"],
+    "bigquery": ["bigquery", "redshift", "databricks"],
+    "hadoop": ["hadoop", "hive", "mapreduce"],
+    "data analysis": ["data analysis", "data analytics", "tableau", "power bi", "looker"],
+    "ansible": ["ansible", "puppet", "chef"],
+    "observability": ["observability", "prometheus", "grafana", "datadog"],
+    "networking": ["networking", "tcp/ip"],
+    "embedded": ["embedded systems", "firmware", "rtos", "microcontroller"],
+    "blockchain": ["blockchain", "solidity", "web3", "smart contracts"],
+    "game development": ["unity", "unreal engine", "game development"],
+    "webpack": ["webpack", "vite", "rollup", "esbuild"],
+    "api design": ["api design", "openapi", "swagger"],
+    "playwright": ["playwright", "puppeteer"],
 }
 
 _SKILL_PATTERNS = {}
@@ -138,16 +155,42 @@ def extract_skills(text: str) -> List[str]:
     return sorted(found)
 
 
-def strip_html_and_truncate(text: str, limit: int = 1500) -> str:
-    """Strips HTML tags, unescapes entities, collapses whitespace, strips leading preview dots, and limits character length."""
+def clean_html_text(text: str) -> str:
+    """Strips HTML tags, unescapes entities, collapses whitespace and leading preview dots (no length limit).
+
+    Run skill/years extraction on THIS (the full text); only the stored description is truncated.
+    """
     if not text:
         return ""
     unescaped = html.unescape(html.unescape(text))
     stripped = HTML_TAG_PATTERN.sub(" ", unescaped)
     collapsed = re.sub(r"\s+", " ", stripped).strip()
     # Strip leading ellipses/periods/dashes from aggregator preview teasers
-    collapsed = re.sub(r"^[\s\.\…\-]+", "", collapsed).strip()
-    return collapsed[:limit]
+    return re.sub(r"^[\s\.\…\-]+", "", collapsed).strip()
+
+
+def strip_html_and_truncate(text: str, limit: int = 1500) -> str:
+    """Cleans HTML and limits character length for storage."""
+    return clean_html_text(text)[:limit]
+
+
+# alias (lowercase) -> canonical skill, built once for canonicalize_skill()
+_ALIAS_TO_CANON = {}
+for _canon, _aliases in SKILLS_TAXONOMY.items():
+    _ALIAS_TO_CANON[_canon.lower()] = _canon
+    for _a in _aliases:
+        _ALIAS_TO_CANON.setdefault(_a.lower(), _canon)
+
+
+def canonicalize_skill(name: str) -> Optional[str]:
+    """Maps a free-form skill string (e.g. from an LLM) to the shared taxonomy, or None if unknown.
+
+    Keeps job skills and candidate skills in one vocabulary so coverage math stays consistent.
+    """
+    if not name:
+        return None
+    key = re.sub(r"\s+", " ", name.lower().strip())
+    return _ALIAS_TO_CANON.get(key)
 
 
 def parse_date_posted(val: Any) -> datetime:

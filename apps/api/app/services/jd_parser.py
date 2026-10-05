@@ -34,19 +34,43 @@ EDUCATION_PATTERN = re.compile(
 
 # Common action verbs that signal engineering duties in sentences
 DUTY_ACTION_VERBS = re.compile(
-    r"^(build|building|develop|developing|design|designing|implement|implementing|maintain|maintaining|create|creating|collaborate|collaborating|work|working|lead|architect|optimize|optimizing|test|testing|deploy|deploying|integrate|integrating|support|supporting)\b",
+    r"^(build|building|develop|developing|design|designing|implement|implementing|maintain|maintaining|create|creating|collaborate|collaborating|work|working|lead|architect|optimize|optimizing|test|testing|deploy|deploying|integrate|integrating|support|supporting|write|writing|ensure|drive|own|partner|contribute|contributing|participate|analyze|research|define|automate|monitor|debug|ship|improve|manage|translate)\b",
+    re.IGNORECASE,
+)
+
+
+# Stored descriptions are whitespace-collapsed (newlines lost), so section headings that end in a colon
+# ("Responsibilities:", "Skills and qualifications:") are isolated onto their own line before splitting.
+_COLON_HEADING = re.compile(
+    "(?:" + "|".join(p.pattern for p in (RESPONSIBILITIES_HEADINGS, REQUIREMENTS_HEADINGS, PREFERRED_HEADINGS)) + r")\s*:",
+    re.IGNORECASE,
+)
+_MAX_HEADING_LINE = 80  # a longer line is prose that merely mentions a heading word, not a heading
+# A sentence that starts with a heading word directly followed by a capitalised word ("Responsibilities Design, ...")
+_LEADING_HEADING = re.compile(
+    "^(?:" + "|".join(p.pattern for p in (RESPONSIBILITIES_HEADINGS, REQUIREMENTS_HEADINGS, PREFERRED_HEADINGS)) + r")\s+(?=(?-i:[A-Z]))",
     re.IGNORECASE,
 )
 
 
 def _split_into_lines_and_sentences(text: str) -> List[str]:
-    """Splits description by newlines, bullet characters, or sentence breaks."""
-    raw_lines = re.split(r"[\n\r•\-\*–—]+", text)
+    """Splits a description into bullet-level lines and sentences.
+
+    Hyphens inside words ("hands-on", "end-to-end") are never split points; only newlines, bullet glyphs,
+    spaced dashes (" - ", used as bullets in collapsed text) and sentence ends are.
+    """
+    text = _COLON_HEADING.sub(lambda m: f"\n{m.group(0)}\n", text)
+    raw_lines = re.split(r"[\n\r•●▪◦\*]+|\s[-–—]\s", text)
     cleaned = []
     for l in raw_lines:
-        line_str = l.strip()
-        if len(line_str) > 10:
-            cleaned.append(line_str)
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", l):
+            line_str = sentence.strip()
+            heading = _LEADING_HEADING.match(line_str)
+            if heading:
+                cleaned.append(heading.group(0).strip())  # heading on its own short line
+                line_str = line_str[heading.end():].strip()
+            if len(line_str) > 10:
+                cleaned.append(line_str)
     return cleaned
 
 
@@ -72,16 +96,17 @@ def parse_job_description(
     for line in lines:
         line_lower = line.lower()
 
-        # Check section headers
-        if PREFERRED_HEADINGS.search(line_lower):
-            current_section = "preferred"
-            continue
-        elif REQUIREMENTS_HEADINGS.search(line_lower):
-            current_section = "requirements"
-            continue
-        elif RESPONSIBILITIES_HEADINGS.search(line_lower):
-            current_section = "responsibilities"
-            continue
+        # Check section headers (only short lines can be headings)
+        if len(line) <= _MAX_HEADING_LINE:
+            if PREFERRED_HEADINGS.search(line_lower):
+                current_section = "preferred"
+                continue
+            elif REQUIREMENTS_HEADINGS.search(line_lower):
+                current_section = "requirements"
+                continue
+            elif RESPONSIBILITIES_HEADINGS.search(line_lower):
+                current_section = "responsibilities"
+                continue
 
         # Collect education mentions
         if EDUCATION_PATTERN.search(line_lower):
