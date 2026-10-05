@@ -1,817 +1,550 @@
-# Technical Architecture: Production Job Matcher Engine
+# Technical Architecture: Job Matcher
 
-> **High-Performance, Zero-Hallucination Semantic Job Matching & Grounded Verification System**  
-> **Target Audience:** Freshers, Early-Career Developers, and Technical Job Seekers  
-> **Core Pipeline:** Document Ingestion $\to$ Deterministic Parsing $\to$ FastEmbed Vector Encoding $\to$ pgvector HNSW ANN Retrieval $\to$ Hybrid Bayesian Math $\to$ Listwise Groq LLM Cross-Attention Re-Ranking $\to$ Grounded Citation Verdicts $\to$ Streamlined Dashboard UX.
+> Describes the system as it runs today. Numbers marked "measured" come from runs on 2026-10-05 (development machine in
+> India, Supabase project, warm connections). For setup and day-to-day usage see [README.md](README.md).
 
----
+**Pipeline in one line:** upload, validate, parse, embed, SQL vector retrieval with seniority filters, deterministic
+scoring, one LLM call that explains the best jobs, deterministic blending, atomic save, read-only dashboard.
 
 ## Table of Contents
-1. [End-to-End System Macro Architecture](#1-end-to-end-system-macro-architecture)
-2. [Catalog Ingestion & Normalization Subsystem (Loop 1)](#2-catalog-ingestion--normalization-subsystem-loop-1)
-3. [5-Layer Document Security & Ingestion Pipeline](#3-5-layer-document-security--ingestion-pipeline)
-4. [Deterministic Resume Section & Entity Parsing Engine](#4-deterministic-resume-section--entity-parsing-engine)
-5. [Deterministic Job Description Section Parser](#5-deterministic-job-description-section-parser)
-6. [Stage 1: pgvector HNSW Retrieval & SQL Seniority Knockout](#6-stage-1-pgvector-hnsw-retrieval--sql-seniority-knockout)
-7. [Stage 2: Deterministic Hybrid Mathematical Scoring Layer](#7-stage-2-deterministic-hybrid-mathematical-scoring-layer)
-8. [Stage 3: Grounded Groq LLM Cross-Attention Re-Ranking](#8-stage-3-grounded-groq-llm-cross-attention-re-ranking)
-9. [In-Process Asynchronous Background Worker & Concurrency Shield](#9-in-process-asynchronous-background-worker--concurrency-shield)
-10. [On-Demand Live Search Fallback Engine](#10-on-demand-live-search-fallback-engine)
-11. [Relational Database Schema & Vector Indexing Model (ERD)](#11-relational-database-schema--vector-indexing-model-erd)
-12. [Frontend Feed & Modal UX Interaction Architecture](#12-frontend-feed--modal-ux-interaction-architecture)
-13. [Security Model, Isolation & Threat Mitigation](#13-security-model-isolation--threat-mitigation)
+1. [System overview](#1-system-overview)
+2. [Catalog ingestion](#2-catalog-ingestion)
+3. [Upload validation](#3-upload-validation)
+4. [Resume parsing](#4-resume-parsing)
+5. [Job description parsing](#5-job-description-parsing)
+6. [Stage 1: SQL retrieval and filters](#6-stage-1-sql-retrieval-and-filters)
+7. [Stage 2: deterministic scoring](#7-stage-2-deterministic-scoring)
+8. [Candidate pool and live fallback](#8-candidate-pool-and-live-fallback)
+9. [Stage 3: LLM explanation](#9-stage-3-llm-explanation)
+10. [Groq gateway](#10-groq-gateway)
+11. [Worker, retries and progress tracking](#11-worker-retries-and-progress-tracking)
+12. [Upload and match lifecycle](#12-upload-and-match-lifecycle)
+13. [Database schema](#13-database-schema)
+14. [Frontend](#14-frontend)
+15. [Security](#15-security)
+16. [Performance and capacity](#16-performance-and-capacity)
+17. [Known limitations](#17-known-limitations)
 
 ---
 
-## 1. End-to-End System Macro Architecture
+## 1. System overview
 
-The platform is designed around two asynchronous decoupled loops:
-- **Loop 1 (Catalog Ingestion):** Continuous, scheduled harvesting, normalization, FastEmbed ONNX vectorization, and upserting of multi-source job postings into a shared Supabase PostgreSQL catalog with an HNSW index.
-- **Loop 2 (Candidate Matching & Verification):** Interactive, user-facing session executing document upload, deterministic parsing, sub-millisecond database vector retrieval, mathematical calibration, listwise Groq cross-attention, and grounded verification.
+Two decoupled loops:
 
-### Macro Architecture ASCII Diagram
+- **Catalog loop (scheduled):** a GitHub Actions job crawls ATS boards every 12 hours, normalizes postings, embeds new
+  ones and upserts them into Supabase.
+- **Candidate loop (interactive):** upload, parse, embed, match, explain, display.
 
 ```
-+========================================================================================================+
-|                                              CLIENT TIER                                               |
-|                                                                                                        |
-|   +------------------------------------------------------------------------------------------------+   |
-|   | Next.js 16 Web Dashboard (React 19 / TypeScript / Tailwind CSS)                                |   |
-|   | - File Upload UI (Dropzone, Progress, File Validation)                                         |   |
-|   | - Top 15 Matches Feed (Two-Tier Badges: Emerald Exact Match vs Zinc Broader Fit)               |   |
-|   | - Streamlined Job Modal (Grounded 2-Sentence Verdict, Green Strengths, Greyed-Out Gaps)         |   |
-|   | - Direct External Apply Redirection                                                            |   |
-|   +------------------------------------------------------------------------------------------------+   |
-+========================================================================================================+
-                                   |                                    ^
-                   HTTPS Requests  |                                    | Server-Sent Events /
-                   + Supabase JWT  |                                    | Supabase Realtime Updates
-                                   v                                    |
-+========================================================================================================+
-|                                           APPLICATION TIER                                             |
-|                                                                                                        |
-|   +------------------------------------------------------------------------------------------------+   |
-|   | FastAPI Asynchronous Service (Python 3.11+ / Uvicorn)                                          |   |
-|   |                                                                                                |   |
-|   |   [Auth Guard]                 [Document Ingestion]              [Deterministic Section Parsers] |   |
-|   |   - Supabase JWT Verification  - 5-Layer Security Sanitizer      - Resume Parser (Regex & State)|   |
-|   |   - User Identity Extraction   - Magic Byte & Zip Bomb Check     - JD Parser (Deductions/Needs) |   |
-|   |                                                                                                |   |
-|   |   [Embedding Service]          [Two-Stage Matching Funnel]       [In-Process Queue Worker]      |   |
-|   |   - FastEmbed (all-MiniLM-L6)  - Stage 1: pgvector HNSW ANN      - asyncio.Queue Throttling     |   |
-|   |   - ONNX Runtime (384-dim)     - Stage 2: Deterministic Math     - asyncio.Semaphore(2) Shield  |   |
-|   |   - Content-Hash Cache Lookup  - Stage 3: Groq LLM Re-Ranking    - In-Flight Deduplication Set  |   |
-|   +------------------------------------------------------------------------------------------------+   |
-+========================================================================================================+
-          |                               |                                      |
-          | Read/Write Isolated Data      | Query Dense Embeddings               | HTTP/2 Keep-Alive
-          | Storage & State               | & Store Relational Catalog           | Listwise Batch Inference
-          v                               v                                      v
-+================================+ +===================================+ +================================+
-|        PERSISTENCE TIER        | |           VECTOR TIER             | |      LLM INFERENCE TIER        |
-|                                | |                                   | |                                |
-|   Supabase PostgreSQL 15       | |   pgvector Extension              | |   Groq Cloud LPUs              |
-|   - auth.users                 | |   - HNSW Cosine Index             | |   - Model: llama-3.3-70b       |
-|   - public.resumes             | |     (m=16, ef_construction=64)    | |     (or gpt-oss-120b)          |
-|   - public.profiles            | |   - match_jobs RPC Stored Proc    | |   - max_tokens: 8000           |
-|   - public.jobs                | |   - ef_search = 150 Runtime Conf  | |   - response_format: json      |
-|   - public.matches             | |   - Seniority Title Knockout      | |   - Grounded Citation Contract |
-|   Supabase Private Storage     | |                                   | |   - First-Principles Rubric    |
-|   - Isolated /resumes/<uid>    | |                                   | |                                |
-+================================+ +===================================+ +================================+
-                                                  ^
-                                                  | Scheduled Batch Upserts
-                                                  | (Loop 1 Catalog Crawler)
-+========================================================================================================+
-|                                       INGESTION & CRAWLER TIER                                         |
-|                                                                                                        |
-|   +------------------------------------------------------------------------------------------------+   |
-|   | Automated Ingestion Engine (GitHub Actions Cron / Local Crawlers)                              |   |
-|   | - ATS Connectors: Greenhouse API, Lever API, Ashby API, SmartRecruiters API                    |   |
-|   | - Aggregator Fallbacks: Adzuna India API, Jooble API, JSearch API, Remotive API                |   |
-|   | - Deterministic Normalizer: MD5 Idempotent UUID, Title Tokenization, Skill Extraction          |   |
-|   | - ONNX FastEmbed Engine: Local CPU batch vectorization (384-dim)                               |   |
-|   +------------------------------------------------------------------------------------------------+   |
-+========================================================================================================+
+                         +------------------------------------------------------+
+                         |  Browser: Next.js 16 app (React 19, Tailwind v4)       |
+                         |  /  sign in/up   /dashboard   /resume                  |
+                         +--------------------------+---------------------------+
+                                                    | fetch /api/backend/*
+                                                    v
+                         +------------------------------------------------------+
+                         |  Next.js route handler (proxy)                         |
+                         |  reads the Supabase session, adds Authorization: Bearer|
+                         +--------------------------+---------------------------+
+                                                    | HTTP
+                                                    v
++---------------------------------------------------------------------------------------------+
+|  FastAPI process (single process; Python 3.11)                                               |
+|                                                                                             |
+|  routes (main.py)        services                                   in-memory state         |
+|  - POST /resumes/upload  - document_validator, resume_parser       - TaskTracker            |
+|  - GET  /matches         - embedding_service (FastEmbed, local)    - MatchingWorker queue   |
+|  - GET  /matches/status  - matching_engine (funnel, math)            (semaphore 2, dedupe,  |
+|  - GET/DELETE /resumes/* - llm_reranker -> groq_gateway               retry timers)         |
+|                          - live_fallback (Adzuna, Jooble)                                   |
++-------+-------------------------------+---------------------------------+-------------------+
+        | psycopg2 pool (DATABASE_URL)  | Storage REST (service role)      | HTTPS, JSON mode
+        v                               v                                  v
++--------------------------+   +-----------------------------+   +--------------------------------+
+| Supabase Postgres 15     |   | Supabase Storage            |   | Groq: openai/gpt-oss-20b       |
+| pgvector 0.8 (HNSW)      |   | private bucket "resumes"    |   | key pool (k1, k2)              |
+| jobs, profiles, matches, |   +-----------------------------+   +--------------------------------+
+| resumes, llm_evaluations |
++------------+-------------+
+             ^
+             | upserts (every 12 h)
++------------+-----------------------------------------------+
+| GitHub Actions: scripts/crawler/crawl_and_sync.py            |
+| 530 boards (Greenhouse 362, Ashby 98, Lever 70)              |
++--------------------------------------------------------------+
 ```
+
+Process model: one Uvicorn worker. The queue, the in-flight set, retry timers and the progress tracker live in memory
+(Section 17). Heavy or blocking work (PDF parsing, embedding, psycopg2 calls, file validation) runs through
+`asyncio.to_thread` so the event loop stays free for status polling.
+
+On startup the lifespan hook starts the worker and a background warm-up that opens the database pool, builds the Groq
+HTTP clients (SSL context creation costs about 0.65 s) and loads the embedding model, so the first user request does not
+pay for them.
 
 ---
 
-## 2. Catalog Ingestion & Normalization Subsystem (Loop 1)
+## 2. Catalog ingestion
 
-The job catalog is maintained independently of user traffic. Crawlers fetch jobs from keyless ATS boards and job aggregators, normalize metadata into a strict relational structure, tag required skills, vectorize descriptions via local CPU ONNX FastEmbed, and upsert records into Supabase.
-
-### Ingestion Flow Diagram
+`scripts/crawler/crawl_and_sync.py`, scheduled by `.github/workflows/crawler.yml` (cron `0 */12 * * *` and manual
+dispatch, 20-minute timeout, only `DATABASE_URL` as a secret).
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                                   RAW DATA SOURCES                                      |
-|  [Greenhouse API]      [Lever API]       [Ashby API]     [SmartRecruiters]    [Adzuna]  |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                              CATALOG NORMALIZER SERVICE                                 |
-|                                                                                         |
-|  1. Key Normalization:                                                                  |
-|     - Clean company name: regex strip "Inc", "LLC", "Pvt Ltd", trim whitespace          |
-|     - Canonical title: strip department prefixes, tags, emojis                          |
-|                                                                                         |
-|  2. Idempotent Deterministic Primary Key Generation:                                     |
-|     id = md5(normalized_company + "::" + normalized_title + "::" + location)            |
-|                                                                                         |
-|  3. Regional Classification:                                                            |
-|     - 'india': Matches "Bengaluru", "Bangalore", "Hyderabad", "Pune", "Delhi", "India"  |
-|     - 'us': Matches "San Francisco", "New York", "Austin", "United States", "USA"       |
-|     - 'remote': Explicit "Remote", "Work from anywhere", "Distributed"                  |
-|                                                                                         |
-|  4. Seniority & Experience Extraction:                                                  |
-|     - Regex parse years: "([0-9]+)\+?\s*(?:to|-)\s*([0-9]+)?\s*years?"                 |
-|     - Extract lower bound: required_years = int(match)                                  |
-|                                                                                         |
-|  5. Skill Extraction Engine:                                                            |
-|     - Dictionary scan against curated technical taxonomy (~450 tech keywords)           |
-|     - Deduplicate and lowercase: e.g. ["python", "fastapi", "docker", "postgres"]       |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                                LOCAL ONNX FASTEMBED                                     |
-|                                                                                         |
-|  - Model: sentence-transformers/all-MiniLM-L6-v2                                        |
-|  - Engine: ONNX Runtime (CPU optimized, zero external API costs)                        |
-|  - Input String: "{title} at {company}. Location: {location}. Skills: {skills}. {desc}" |
-|  - Output: 384-dimensional dense float32 vector                                         |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                                SUPABASE POSTGRESQL                                      |
-|                                                                                         |
-|  INSERT INTO public.jobs (id, title, company, location, region, description,            |
-|                           skills, required_years, embedding, is_active, last_seen_at)   |
-|  ON CONFLICT (id) DO UPDATE SET last_seen_at = now(), is_active = true                  |
-+-----------------------------------------------------------------------------------------+
+scripts/seed/seed.json (530 boards)
+        |  parallel, rate-limited httpx
+        v
+Greenhouse  boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true
+Lever       api.lever.co/v0/postings/{slug}?mode=json
+Ashby       api.ashbyhq.com/posting-api/job-board/{slug}
+        |
+        v  normalize
+  - drop senior titles (staff, principal, director, vp, vice president, head of, lead, architect, fellow)
+  - keep engineering titles only (ENG_TITLE_RE)
+  - region by keyword, in this order: india -> remote -> us  (anything else is dropped)
+  - id = "{ats}:{slug}:{external id}"      (stable, de-duplicates re-crawls)
+  - description = HTML-stripped, whitespace-collapsed, truncated to 1,500 chars for storage
+  - skills and required_years are extracted from the FULL cleaned text, before truncation
+        |
+        v
+  existing ids  -> UPDATE last_seen_at = now(), is_active = true
+  new ids       -> embed "{title}. {first 600 chars of description}" with FastEmbed (batch 64) and INSERT
+        |
+        v  housekeeping
+  - jobs not seen for 14 days -> is_active = false
+  - if more than 15,000 active -> delete the least recently seen rows
 ```
+
+Current catalog (measured): 9,618 active jobs: US 7,060, India 1,701, remote 857. Sources: Greenhouse 6,516, Ashby 2,041,
+Lever 955, Jooble 80, Adzuna 26 (the last two arrive through the live fallback).
+
+**Skills taxonomy** (`catalog_normalizer.py`): 118 canonical skills with 274 aliases, matched with word-boundary-aware
+regexes. Candidate skills and job skills use the same vocabulary, which is what keeps the coverage maths meaningful.
+`canonicalize_skill()` maps free-form text (for example LLM output) back onto it.
+
+**Years of experience:** the lowest "N years" / "N-M years" figure up to 15 found in the text. About 94% of the catalog
+(88% of India and remote jobs) states none, which is why seniority is also filtered by title.
 
 ---
 
-## 3. 5-Layer Document Security & Ingestion Pipeline
+## 3. Upload validation
 
-To protect the server from malformed, weaponized, or unreadable files, the upload route enforces a rigorous 5-layer sanitization barrier before any text parsing or LLM inference takes place.
-
-### Document Validation Security Gate Diagram
+`document_validator.validate_document` runs five layers in order and raises a typed error on the first failure:
 
 ```
-[Raw Incoming File Stream]
-            |
-            v
-+-------------------------------------------------------------------------+
-| LAYER 1: Hard Size Limit Verification                                   |
-| - Max file size: 5.0 MB (5 * 1024 * 1024 bytes)                        |
-| - Rejection: 413 Payload Too Large                                      |
-+-------------------------------------------------------------------------+
-            | Passes
-            v
-+-------------------------------------------------------------------------+
-| LAYER 2: Extension & Sanitization Barrier                               |
-| - Allowed: .pdf, .docx, .doc, .txt                                      |
-| - Safe filename: regex strip path traversal (`../`, `\`, null bytes)    |
-| - Rejection: 400 Bad Request ("Disallowed file extension")              |
-+-------------------------------------------------------------------------+
-            | Passes
-            v
-+-------------------------------------------------------------------------+
-| LAYER 3: Magic Byte (File Signature) Verification                       |
-| - PDF: must begin with b"%PDF-" (0x25 0x50 0x44 0x46)                   |
-| - DOCX: must begin with b"PK\x03\x04" (ZIP archive signature)           |
-| - Rejection: 400 Bad Request ("Spoofed MIME type detected")             |
-+-------------------------------------------------------------------------+
-            | Passes
-            v
-+-------------------------------------------------------------------------+
-| LAYER 4: Decompression Bomb & Malicious Entity Defense                  |
-| - DOCX: checks uncompressed zip entry sizes; rejects if ratio > 100:1   |
-| - Disables XML external entities (XXE) and recursive expansions         |
-| - Rejection: 400 Bad Request ("Decompression bomb detected")            |
-+-------------------------------------------------------------------------+
-            | Passes
-            v
-+-------------------------------------------------------------------------+
-| LAYER 5: Extractability & Content Density Validation                    |
-| - PDF: parsed with pdfplumber; DOCX: parsed with python-docx            |
-| - Min length requirement: >= 100 characters of readable text            |
-| - Rejection: 400 Bad Request ("Scanned image or unreadable document")   |
-+-------------------------------------------------------------------------+
-            |
-            v [Sanitized Document Object]
-   (raw_bytes, safe_filename, extracted_text, content_type)
+1. Size          non-empty and at most 5 MB
+2. Filename      no path traversal; no executable/script extension anywhere in the name
+                 (exe, bat, sh, ps1, js, py, php, jar, dll ...); only .pdf and .docx allowed
+3. Magic bytes   PDF must start with %PDF-, DOCX with the ZIP signature PK\x03\x04
+4. DOCX structure  at most 200 archive entries; at most 25 MB uncompressed; no VBA/macros;
+                 must contain word/document.xml (a generic ZIP is rejected)
+5. Content       text extraction must yield at least 50 readable alphanumeric characters
+                 (scanned/image-only documents fail here)
 ```
+
+The stored file name is a random UUID plus the extension, never the uploaded name. Validation runs in a worker thread.
 
 ---
 
-## 4. Deterministic Resume Section & Entity Parsing Engine
+## 4. Resume parsing
 
-Rather than relying on non-deterministic LLM calls to parse resumes (which is slow, expensive, and prone to format errors), the platform uses a high-speed, deterministic regex state machine.
-
-### Resume Parser Subsystem Diagram
+`resume_parser.parse_resume` is deterministic (no LLM):
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                                    RAW EXTRACTED TEXT                                   |
-|                   (e.g., from pdfplumber / python-docx stream)                           |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                              HEADING DETECTION ENGINE                                   |
-|  Matches major resume landmarks using case-insensitive anchor patterns:                 |
-|  - Education:     r'^(?:education|academic\s+background|qualifications)'               |
-|  - Experience:    r'^(?:experience|work\s+history|employment|internships?)'             |
-|  - Projects:      r'^(?:projects|technical\s+projects|academic\s+projects)'             |
-|  - Skills:        r'^(?:technical\s+skills|skills\s+&?\s+tools?|competencies)'          |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                               SECTION PARTITIONER                                       |
-|  Segments text into structured string buffers:                                          |
-|  {                                                                                      |
-|    "education":  "B.Tech in Computer Science, MIT (2020-2024)...",                      |
-|    "experience": "Software Engineering Intern @ QMax (Jan 2024 - Jun 2024)...",         |
-|    "projects":   "RailMind | Python, FastAPI, YOLOv8... JanSamadhan | React, Node...",  |
-|    "skills":     "Python, FastAPI, TypeScript, React, Docker, PostgreSQL..."             |
-|  }                                                                                      |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                            ENTITIES & TENURE CALCULATOR                                 |
-|                                                                                         |
-|  1. Skill Extraction:                                                                   |
-|     - Case-insensitive token boundary match against 450+ canonical tech terms           |
-|     - Deduplicates: ["python", "fastapi", "react", "docker", "postgresql"]             |
-|                                                                                         |
-|  2. Work History & Internship Analysis:                                                 |
-|     - Parses date ranges: "Jan 2024 - Jun 2024", "08/2023 to 12/2023"                   |
-|     - Distinguishes "Intern" / "Trainee" keywords from full-time titles                 |
-|     - Calculates:                                                                       |
-|         internship_months = sum(internship duration)                                   |
-|         full_time_experience_years = sum(non-internship duration)                       |
-|                                                                                         |
-|  3. Fresher Classification Contract:                                                    |
-|     is_fresher = (full_time_experience_years <= 1.0)                                    |
-|                                                                                         |
-|  4. Structured Entity Output:                                                           |
-|     - Projects: List[{name: str, summary: str}]                                         |
-|     - Experience: List[{role_and_company: str, summary: str}]                           |
-+-----------------------------------------------------------------------------------------+
+PDF:  pdfplumber lines with font size and bold flags      DOCX: python-docx paragraphs
+        |
+        v  heading detection (size, boldness, known heading names; aliases such as "internships" -> experience)
+   sections: skills, experience, projects, education, ...  +  a markdown rendering of the document
+        |
+        +-- skills          shared taxonomy applied to the full text
+        +-- headline        the line under the candidate's name (at most 60 chars, no email/link/phone markers),
+        |                   else the first sentence of a summary section (at most 90 chars)
+        +-- preferred_roles headline split on "|" and "/"
+        +-- tenure          date ranges found in the experience section
 ```
+
+**Fresher-first rule:** a dated experience range counts as internship/project time unless the surrounding lines
+explicitly say full-time, FTE or permanent without intern/contract words. Overlapping ranges are merged. Then:
+
+```
+full_time_experience_years = merged full-time months / 12
+internship_months          = merged internship months
+is_fresher                 = full_time_experience_years < 1.0
+```
+
+`profile_enricher` (one small LLM call) runs only if the parser produced no headline or no roles, and it is skipped when
+the stored profile already holds an LLM-derived result for identical resume text (`markdown_hash`).
+
+**Candidate embedding payload:** `"Role: {headline}. Skills: {skills}. Experience: {Fresher / Entry-level [with N months
+internship experience] | N years full-time}."` embedded with `all-MiniLM-L6-v2`. The SHA-256 of that payload is the
+profile `content_hash`; it also keys the evaluation cache.
 
 ---
 
-## 5. Deterministic Job Description Section Parser
+## 5. Job description parsing
 
-Before a job description is processed for matching or LLM cross-attention, it is passed through `app.services.jd_parser.py`. This deterministic parser segments raw, unstructured text into a clean structured schema in $<1\text{ms}$.
+`jd_parser.parse_job_description` turns a stored description into `responsibilities`, `required_skills`,
+`preferred_skills`, `experience_level` and `education`. It runs for the 12 to 18 jobs sent to the LLM, in about a millisecond each.
 
-### JD Parser Architecture Diagram
+Stored descriptions are whitespace-collapsed, so structure has to be recovered:
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                               RAW UNSTRUCTURED JD TEXT                                  |
-|     (Contains mixed headers, HR boilerplate, company marketing, duties, and tools)      |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                        DETERMINISTIC REGEX SECTION SPLITTER                             |
-|                                                                                         |
-|  Scans for section header markers:                                                      |
-|  - Responsibilities: "What you will do", "Duties", "Key Responsibilities", "Day to Day"|
-|  - Requirements:     "Requirements", "Basic Qualifications", "Must Haves", "Skills"     |
-|  - Preferred/Bonus:  "Nice to have", "Preferred Qualifications", "Bonus points"         |
-|  - Experience Level: "0-2 years", "Entry level", "Fresher", "Associate", "Senior"       |
-|  - Education:        "B.S.", "B.Tech", "Computer Science", "Equivalent experience"      |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                           STRUCTURED JD OBJECT (SCHEMA)                                 |
-|                                                                                         |
-|  {                                                                                      |
-|    "role_title":         "Full Stack Engineer",                                         |
-|    "company":            "Acme Corp",                                                   |
-|    "experience_level":   "Entry-Level / Fresher (0-1 years)",                           |
-|    "responsibilities":   [                                                              |
-|                            "Build scalable REST APIs using Node.js and TypeScript",     |
-|                            "Develop responsive frontend interfaces with React"          |
-|                          ],                                                             |
-|    "required_skills":    ["react", "typescript", "node.js", "rest api", "sql"],        |
-|    "preferred_skills":   ["docker", "aws", "tailwind css"],                             |
-|    "education":          "Bachelor's degree in Computer Science or related field"       |
-|  }                                                                                      |
-+-----------------------------------------------------------------------------------------+
+- headings that end in a colon ("Responsibilities:", "Skills and qualifications:") are isolated onto their own line
+- a sentence that starts with a heading word followed by a capital ("Responsibilities Design, ...") is split from it
+- split points are newlines, bullet glyphs, spaced dashes " - " and sentence ends;
+  hyphens inside words ("hands-on", "end-to-end") are never split points
+- only lines of 80 characters or fewer can be headings
+- skills: all tagged skills minus those that appear only under a preferred/nice-to-have heading
 ```
+
+In the reranker, a posting whose only listed skills sit under a "Preferred" heading treats them as required. A posting
+with no tagged skills at all is sent with `skills_unknown: true`.
 
 ---
 
-## 6. Stage 1: pgvector HNSW Retrieval & SQL Seniority Knockout
+## 6. Stage 1: SQL retrieval and filters
 
-When a candidate profile is matched, Stage 1 performs dense approximate nearest neighbor (ANN) retrieval over the entire job catalog using PostgreSQL's `pgvector` extension and an HNSW index, with hard exclusion filters applied directly in SQL.
-
-### Database Retrieval & Seniority Knockout Diagram
+`match_jobs(query_embedding, match_threshold, match_count, filter_region, filter_max_years, is_fresher_candidate)` is a
+PL/pgSQL function. The funnel calls it with threshold 0.20 and `match_count` 100.
 
 ```
-               Candidate Profile Embedding (384-dim Float Vector)
-                                       |
-                                       v
-+-----------------------------------------------------------------------------------------+
-|                     SUPABASE POSTGRESQL STORED PROCEDURE: match_jobs                     |
-|                                                                                         |
-|  1. Runtime HNSW Exploration Setting:                                                   |
-|     PERFORM set_config('hnsw.ef_search', '150', true);                                  |
-|     (Guarantees full exploration across 150 graph nodes, preventing early truncation)   |
-|                                                                                         |
-|  2. Cosine Distance Operator:                                                           |
-|     distance = (j.embedding <=> query_embedding)                                        |
-|     similarity = 1.0 - distance                                                         |
-|                                                                                         |
-|  3. SQL Hard Seniority Knockout Filter (Zero-Leakage Invariant):                        |
-|     AND NOT (                                                                           |
-|         j.normalized_title ~* '\y(director|vp|vice president|head of)\y'                |
-|         OR j.title ~* '\y(director|vp|vice president|head of)\y'                        |
-|     )                                                                                   |
-|     AND (                                                                               |
-|         NOT is_fresher_candidate OR                                                     |
-|         NOT (                                                                           |
-|             j.normalized_title ~* '\y(senior|sr\.?|lead|architect|manager|mgr|staff|principal)\y'
-|             OR j.title ~* '\y(senior|sr\.?|lead|architect|manager|mgr|staff|principal)\y'
-|         )                                                                               |
-|     )                                                                                   |
-|                                                                                         |
-|  4. Regional Partition Expansion & Negative Geographic Knockout:                        |
-|     - Target 'india'  => Matches j.region IN ('india', 'remote')                         |
-|                          AND NOT restricted to non-India locations/timezones:            |
-|                          (location ~* '\y(amer|us only|canada|uk|france|germany|emea)\y')|
-|     - Target 'us'     => Matches j.region IN ('us', 'remote')                            |
-|     - Target 'remote' => Matches j.region = 'remote'                                    |
-|                                                                                         |
-|  5. Experience Years Ceiling:                                                           |
-|     - Freshers:    j.required_years IS NULL OR j.required_years <= 1                    |
-|     - Experienced: j.required_years IS NULL OR j.required_years <= (candidate_years + 1)|
-|                                                                                         |
-|  ORDER BY j.embedding <=> query_embedding ASC LIMIT 100;                                |
-+-----------------------------------------------------------------------------------------+
-                                       |
-                                       v
-                Candidate Pool of Top 50-100 Semantically Relevant Jobs
-                     (All Senior/Lead/Manager Roles Completely Eliminated)
+PERFORM set_config('hnsw.ef_search', '150', true)               wider graph exploration per query
+
+WHERE is_active AND embedding IS NOT NULL
+  AND cosine similarity >= threshold
+  AND NOT title ~* '\y(director|vp|vice president|head of)\y'       everyone
+  AND (NOT is_fresher OR NOT title ~* '\y(senior|sr\.?|lead|architect|manager|mgr|staff|principal)\y')
+  AND region rule      'india' -> india + remote | 'us' -> us + remote | 'remote' -> remote | 'all' | exact match
+  AND experience rule  required_years IS NULL
+                       OR (fresher AND required_years <= 1)
+                       OR (experienced AND required_years <= filter_max_years + 1)
+ORDER BY embedding <=> query_embedding  LIMIT match_count
 ```
+
+The seniority and experience rules live in SQL on purpose: application code cannot forget to apply them. The index is
+HNSW with cosine ops and pgvector's default build parameters (`m=16`, `ef_construction=64`).
 
 ---
 
-## 7. Stage 2: Deterministic Hybrid Mathematical Scoring Layer
+## 7. Stage 2: deterministic scoring
 
-Stage 2 takes the vector search results and evaluates them with a deterministic mathematical scoring formula. This eliminates the "single-skill fluke" anomaly (where a terse job description containing only one skill scored 90%+) by introducing a Bayesian Denominator Floor, a Dual-Track Math Safeguard, and a Non-Linear Reality Dampener.
-
-### Mathematical Scoring Architecture Diagram
+`matching_engine.score_job` scores each of the up to 100 rows (about 2 ms in total):
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                              INPUT SIGNALS PER CANDIDATE JOB                            |
-|  - raw_sim: Cosine similarity [0.0, 1.0] from pgvector                                  |
-|  - candidate_skills: Set of verified technical skills from resume                       |
-|  - job_skills: Set of explicit technical skills extracted from JD                       |
-|  - candidate_roles: Preferred target roles & extracted headline                         |
-|  - job_title: Canonical job title                                                       |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 1. SEMANTIC NORMALIZATION (Min-Max Scaling)                                             |
-|    Cosine similarities for sentence-transformers naturally cluster in [0.30, 0.75].     |
-|                                                                                         |
-|    clamped = max(0.30, min(0.75, raw_sim))                                              |
-|    S_norm  = (clamped - 0.30) / (0.75 - 0.30)                                           |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 2. DUAL-TRACK MATH SAFEGUARD & BAYESIAN DENOMINATOR FLOOR                               |
-|                                                                                         |
-|    Track A: Standard Jobs (|job_skills| > 0)                                            |
-|    - matched_skills = candidate_skills ∩ job_skills                                     |
-|    - denominator    = max(|job_skills|, 3)                                              |
-|    - C_skill        = |matched_skills| / denominator                                    |
-|    - Base_Score     = 0.40 * S_norm + 0.60 * C_skill + B_title                          |
-|                                                                                         |
-|    Track B: Terse / Empty-Skill Postings (|job_skills| == 0)                             |
-|    - Purely semantic track with strict score ceiling:                                   |
-|    - Base_Score = 0.70 * S_norm + B_title                                               |
-|    - Final Score is strictly capped at 65% max (68% blended ceiling)                     |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 3. ROLE & TITLE ALIGNMENT BOOST                                                         |
-|    B_title = +0.05 (+5%) if any role token matches job title; else 0.0                   |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 4. BASE SCORE SYNTHESIS                                                                 |
-|    Base_Score = 0.40 * S_norm + 0.60 * C_skill + B_title                                |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 5. NON-LINEAR REALITY DAMPENER (Knockout Penalty)                                       |
-|    Prevents candidates with 0 matching skills from receiving high scores due to        |
-|    broad semantic similarity.                                                           |
-|                                                                                         |
-|    D_skill = 1.00  if C_skill >= 0.50                                                   |
-|    D_skill = 0.85  if 0.25 <= C_skill < 0.50                                            |
-|    D_skill = 0.60  if 0.00 < C_skill < 0.25                                             |
-|    D_skill = 0.35  if C_skill == 0.00 (Hard Knockout Penalty for 0% skill overlap)       |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-| 6. FINAL DETERMINISTIC MATH SCORE                                                       |
-|    Score_math = round(clamp(Base_Score * D_skill * 100, 0, 100))                         |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-               Sorted & Truncated to Top 15 Finalists with Company Diversity Cap
-                 (Strict maximum of 2 postings per employer to prevent feed spam)
+S_norm  = clamp((cosine - 0.30) / (0.75 - 0.30), 0, 1)
+C_skill = |candidate ∩ job skills| / max(|job skills|, 3)            Bayesian floor: a 1-skill posting cannot reach 100%
+B_title = 0.05 if any role token (frontend, backend, ai, ml, devops, ...) appears in both the candidate's
+          roles/headline and the job title, else 0
+
+standard track (job has skills):   Base = 0.40*S_norm + 0.60*C_skill + B_title
+                                   D = 1.00 (C >= 0.50) | 0.85 (C >= 0.25) | 0.60 (C > 0) | 0.35 (C = 0 on a multi-skill job)
+                                   Score = round(clamp(Base * D * 100, 0, 100))
+dual track (job has no skills):    Score = round(min(65, 0.70*S_norm + B_title)*100)
 ```
+
+The reality dampener stops high semantic similarity from hiding a total tooling mismatch. The dual track stops terse
+postings from outranking well-described ones.
 
 ---
 
-## 8. Stage 3: Grounded Groq LLM Cross-Attention Re-Ranking
+## 8. Candidate pool and live fallback
 
-The Top 15 finalists from deterministic math scoring are passed to Groq (`openai/gpt-oss-20b` primary with `openai/gpt-oss-120b` fallback) in a single listwise batch prompt (RankGPT paradigm). The LLM evaluates candidate projects and verified skills against each job's structured schema, outputting grounded verdicts and transparent score deductions in $<2\text{s}$.
+After scoring, rows are sorted by score, then date, then id, and a candidate pool of up to 20 is built:
 
-### LLM Cross-Attention Pipeline Diagram
+- at most **2 jobs per company** (by normalized company name);
+- at most **one posting per (company, normalized title)**, which removes duplicate aggregator copies.
 
-```
-+-------------------------------------+   +-------------------------------------+
-|      STRUCTURED CANDIDATE SCHEMA    |   |     STRUCTURED CANDIDATE JOBS       |
-|  - headline                         |   |  - Top 15 Compressed Job Cards      |
-|  - experience_years / is_fresher    |   |  - role_title & company             |
-|  - verified_skills (35 max)         |   |  - responsibilities (clean bullets) |
-|  - projects: [{name, summary}]      |   |  - required_skills                  |
-|  - experience: [{role, company}]    |   |  - preferred_skills                 |
-+-------------------------------------+   +-------------------------------------+
-                   \                                 /
-                    \                               /
-                     v                             v
-+-----------------------------------------------------------------------------------------+
-|                             LISTWISE BATCH PROMPT TO GROQ                               |
-|                                                                                         |
-|  - Persistent HTTP client with keep-alive & 35s timeout to api.groq.com                 |
-|  - Model: openai/gpt-oss-20b (~1.2s latency) with openai/gpt-oss-120b fallback           |
-|  - Parameters: max_tokens = 4096, temperature = 0.0, response_format = json_object      |
-|                                                                                         |
-|  STRICT SYSTEM CONTRACT:                                                                |
-|  1. Grounded Citation Mandate: In every 'verdict', you MUST cite at least one specific |
-|     candidate project name (e.g. *RailMind*, *JanSamadhan*) or employer (e.g. *QMax*)   |
-|     proving ability to perform core duties.                                             |
-|  2. Anti-Hallucination Barrier: Never claim candidate knows tools not in verified_skills|
-|  3. Deductions: Explicit point penalties for missing tools (2-5 pts each)               |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                               GROQ JSON OUTPUT SCHEMA                                   |
-|                                                                                         |
-|  {                                                                                      |
-|    "evaluations": [                                                                     |
-|      {                                                                                  |
-|        "job_id": "c7a8b9e0...",                                                         |
-|        "verdict": "Your RailMind project proves strong proficiency with FastAPI and ... |
-|                    However, you lack experience with AWS ECS and Docker deployments.",  |
-|        "strengths": ["FastAPI", "Python", "PostgreSQL", "REST APIs"],                   |
-|        "gaps": ["Docker", "AWS ECS"],                                                   |
-|        "deductions": [                                                                  |
-|          {"skill": "Docker", "points": 5, "reason": "No containerization in portfolio"},|
-|          {"skill": "AWS", "points": 4, "reason": "Cloud deployment experience missing"} |
-|        ],                                                                               |
-|        "capability_fit": 88,                                                            |
-|        "tooling_fit": 72,                                                               |
-|        "seniority_fit": 80                                                              |
-|      }                                                                                  |
-|    ]                                                                                    |
-|  }                                                                                      |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                       DETERMINISTIC PYTHON SCORE BLENDING                               |
-|                                                                                         |
-|  1. Raw LLM Rubric Score:                                                               |
-|     Score_llm_raw = 0.50 * capability_fit + 0.30 * tooling_fit + 0.20 * seniority_fit   |
-|                                                                                         |
-|  2. Deduction Subtraction (Capped at 15 points max penalty):                             |
-|     penalty   = min(15, sum(d["points"] for d in deductions))                           |
-|     Score_llm = clamp(Score_llm_raw - penalty, 0, 100)                                  |
-|                                                                                         |
-|  3. Blended Final Calibration:                                                          |
-|     Final_Score = round(0.30 * Score_math + 0.70 * Score_llm)                           |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                               ATOMIC PERSISTENCE LAYER                                  |
-|  INSERT INTO public.matches (user_id, job_id, match_score, matched_skills,              |
-|                              missing_skills, explanation, score_breakdown)              |
-|  ON CONFLICT (user_id, job_id) DO UPDATE SET match_score = EXCLUDED.match_score ...     |
-+-----------------------------------------------------------------------------------------+
-```
+**Live fallback** (`live_fallback.py`) runs only when `match_jobs` returned **fewer than 10 rows** and the profile has
+preferred roles. Adzuna (India) and Jooble run in parallel, results are normalized with the same skill and years
+extraction as the crawler, embedded in one batch, and upserted into `public.jobs` (skills are only replaced when the new
+list is longer). Embedding and psycopg2 work run in a worker thread. The fallback uses no LLM.
 
 ---
 
-## 9. In-Process Asynchronous Background Worker & Concurrency Shield
+## 9. Stage 3: LLM explanation
 
-To eliminate the operational complexity and cost of external task queues (such as Celery, Redis, or RabbitMQ), the platform embeds an in-process asynchronous matching worker managed within FastAPI's lifespan context.
-
-### Queue Worker & Concurrency Shield Diagram
+`llm_reranker.rerank_finalists_with_llm` receives the ordered pool and a target of 10.
 
 ```
-[Resume Upload Completed]
-           |
-           v
-+-------------------------------------------------------------------------+
-| Content-Hash Cache Inspection                                           |
-| - Compare candidate_embedding_payload hash against existing_profile     |
-| - If identical hash AND public.matches exists:                          |
-|   -> Cache Hit: Bypass worker entirely (0ms CPU, 0 tokens)              |
-+-------------------------------------------------------------------------+
-           | Cache Miss / New Resume
-           v
-+-------------------------------------------------------------------------+
-| IN-PROCESS ASYNC MATCHING WORKER (app.core.worker.py)                   |
-|                                                                         |
-|  +-------------------------------------------------------------------+  |
-|  | In-Flight Deduplication Set (set[str])                            |  |
-|  | - If user_id is already currently queued or executing, reject     |  |
-|  |   duplicate requests immediately                                  |  |
-|  +-------------------------------------------------------------------+  |
-|                                  | Enqueued                             |
-|                                  v                                      |
-|  +-------------------------------------------------------------------+  |
-|  | asyncio.Queue (FIFO Buffer)                                       |  |
-|  | - Buffers background matching requests for authenticated users    |  |
-|  +-------------------------------------------------------------------+  |
-|                                  | Dequeued                             |
-|                                  v                                      |
-|  +-------------------------------------------------------------------+  |
-|  | asyncio.Semaphore(2) Concurrency Shield                           |  |
-|  | - Limits concurrent heavy matching funnels to at most 2 tasks     |  |
-|  | - Protects CPU memory and Groq API token per-minute limits        |  |
-|  +-------------------------------------------------------------------+  |
-|                                  | Acquired Permit                      |
-|                                  v                                      |
-|  +-------------------------------------------------------------------+  |
-|  | execute_matching_funnel(user_id, region, limit=15)                |  |
-|  | - Updates thread-safe TaskTracker across 6 real-time milestones:  |  |
-|  |   10% Doc Ingestion -> 25% Parsing -> 55% Vector -> 70% Math      |  |
-|  |   -> 82% LLM Re-rank -> 95% Persistence -> 100% Complete          |  |
-|  | - Atomically writes results to public.matches                     |  |
-|  | - Releases semaphore & removes user_id from in-flight set        |  |
-|  +-------------------------------------------------------------------+  |
-+-------------------------------------------------------------------------+
-                                   |
-                                   v  (Polled every 800ms by Next.js client)
-+-------------------------------------------------------------------------+
-| LIVE TASK PROGRESS TRACKER (app.core.task_tracker.py)                   |
-| - Authenticated endpoint: GET /matches/status                           |
-| - Response: { status, progress, step_label, error, updated_at }         |
-| - Powers locked modal progress bar and eliminates UI race conditions    |
-+-------------------------------------------------------------------------+
+pool (best math score first, up to 20)
+   |
+   |-- cache lookup: llm_evaluations rows for (user_id, resume content_hash, job ids)
+   |       a row is reused only if its job_sig (hash of title + skills) still matches the job
+   |
+   |-- call 1: the first 12 jobs that are not cached           (target 10 + 2 spare)
+   |-- if fewer than 10 jobs have an explanation:
+   |       call 2 (top-up): the next-ranked uncached jobs, at most min(6, missing + 1)
+   |-- at most 4 Groq calls per run in total
+   |
+   |-- new valid evaluations are written back to the cache
+   |
+   '-- blend, sort, keep the best 10 explained jobs
 ```
+
+**Prompt.** One static system prompt (rules, rubric, output schema) and one compact JSON user message (no indentation).
+Jobs are keyed `"1"` to `"N"` instead of by their long ids, so the model cannot mangle an id. Each job carries title,
+company, level, up to 3 duties of at most 140 characters, `match` and `gaps` (required skills the candidate has or lacks,
+pre-computed in Python), preferred skills, and `skills_unknown` when applicable. The candidate block lists headline,
+years, `is_fresher`, all verified skills (deduplicated), up to 5 projects and up to 3 experience entries.
+
+System rules: skills in `candidate.skills` are ground truth and must never be called missing; gaps and deductions may
+only use that job's pre-computed gaps; every verdict must cite a candidate project or experience; verdicts are at most 25
+words in the second person; blank-skill jobs get no deductions.
+
+**Request parameters.** `temperature=0`, `seed=42`, JSON mode, `max_tokens = 350 + 170 * jobs`,
+`reasoning_effort=low`, `include_reasoning=false` (both dropped automatically if the model rejects them).
+
+**Validation.** An evaluation counts only if it has a verdict of at least 8 characters and three integer sub-scores in
+0 to 100. Invalid items are treated as missing.
+
+**Blending (Python only).**
+
+```
+LLM   = clamp(0.50*capability + 0.30*tooling + 0.20*seniority - min(15, valid deductions), 0, 100)
+Final = round(0.30*Score_math + 0.70*LLM);  jobs with no tagged skills are capped at 68
+```
+
+A deduction is ignored if the candidate has that skill or the job does not list it. Strengths are intersected with the
+candidate's skills, gaps are filtered against them, and any verdict phrase like "lacks X" for a skill the candidate has is
+rewritten.
+
+**Outcomes.**
+
+| Situation | Result |
+|---|---|
+| 10 explained | saved and shown |
+| Output truncated or invalid JSON | the batch is split in halves (depth at most 2) and retried, never another model |
+| Groq unavailable (rate limit, outage) | explained jobs so far are kept; unexplained candidates are saved **hidden** (`score_breakdown.llm_pending`); `retry_after` is returned |
+| No Groq key configured | funnel reports an error |
+
+A job without an explanation is never returned by `GET /matches`.
 
 ---
 
-## 10. On-Demand Live Search Fallback Engine
+## 10. Groq gateway
 
-When a candidate uploads a resume for a specialized or niche tech stack and the shared Supabase catalog returns fewer than 5 high-confidence matches ($Score \ge 60\%$), the live fallback engine triggers dynamically.
-
-### Live Search Fallback Flow Diagram
+`groq_gateway.py` is the only code that talks to Groq. It is also used by profile enrichment and the offline backfill.
 
 ```
-Candidate Matches Evaluated from Shared Catalog
-                     |
-                     v
-       Are High-Confidence Matches (Score >= 60%) < 5?
-                    / \
-             NO    /   \   YES
-                  /     \
-                 v       v
-+------------------+   +---------------------------------------------------+
-| Proceed directly |   | TRIGGER LIVE FALLBACK SEARCH (live_fallback.py)   |
-| to Groq Re-Rank  |   |                                                   |
-+------------------+   | 1. Formulate Query:                               |
-                       |    - Query = "{headline} {top_candidate_skills}"   |
-                       |    - Location = candidate target region (India/US)|
-                       |                                                   |
-                       | 2. Fetch External Jobs:                           |
-                       |    - Query Adzuna India API                       |
-                       |    - Query Jooble India API                       |
-                       |                                                   |
-                       | 3. Normalize & Deduplicate:                       |
-                       |    - Strip formatting & boilerplate               |
-                       |    - Generate deterministic MD5 ID                |
-                       |                                                   |
-                       | 4. On-the-Fly Vectorization:                      |
-                       |    - FastEmbed CPU ONNX vectorization (384-dim)   |
-                       |                                                   |
-                       | 5. Upsert to Supabase public.jobs:                |
-                       |    - Instantly enriches the shared global catalog |
-                       |                                                   |
-                       | 6. Re-evaluate Funnel:                            |
-                       |    - Re-runs Stage 1 & 2 including fresh jobs     |
-                       +---------------------------------------------------+
-                                                 |
-                                                 v
-                                   Proceed to Groq Re-Rank
+chat_json(messages, max_tokens, purpose, max_wait)
+   |
+   v  estimate = chars/3 + 40 + max_tokens
+ pick the key that is ready soonest (ties: most spare budget)       keys: k1 = GROQ_API_KEY, k2 = GROQ_API_KEY_FALLBACK
+   |  per key: sliding 60 s windows for requests (RPM 25) and estimated tokens (TPM 6500),
+   |  cooldown timestamp, x-ratelimit-remaining/reset headers
+   |  reserve capacity, wait if needed (> max_wait -> LLMUnavailable)
+   v
+ POST (timeout 20 s, at most 2 requests in flight)
+   |
+   +-- 200  -> finish_reason "length" or invalid JSON -> LLMTruncated ; else parsed result
+   +-- 429  -> cooldown = Retry-After; if the error names an organization, cool down every key of that org
+   |           retry once on the other key, else LLMUnavailable(retry_after)
+   +-- 400  -> reasoning params rejected: drop them and retry ; json_validate_failed -> LLMTruncated ; else LLMBadResponse
+   +-- 413  -> LLMTruncated
+   +-- 401/403 -> key disabled
+   +-- 5xx / timeout -> short cooldown, retry once
 ```
+
+Every attempt logs purpose, key label, status, latency, tokens and remaining-token headers; the key itself is never
+logged. Rate limits are per organization and per model, so two keys help only if they belong to different
+organizations; the gateway logs a warning when it detects two keys sharing one.
 
 ---
 
-## 11. Relational Database Schema & Vector Indexing Model (ERD)
+## 11. Worker, retries and progress tracking
 
-The persistence layer runs on PostgreSQL 15 within Supabase, using foreign key cascade rules and strict Row-Level Security (RLS) to ensure user data isolation.
-
-### Entity Relationship Diagram (ERD)
+`core/worker.py`:
 
 ```
-+-----------------------------------+
-|            auth.users             |
-|-----------------------------------|
-| id                   UUID  <PK>   |
-| email                TEXT         |
-| encrypted_password   TEXT         |
-| created_at           TIMESTAMPTZ  |
-+-----------------------------------+
-         |                  |
-         | 1:1              | 1:1
-         v                  v
-+--------------------+   +-----------------------------------+
-|  public.profiles   |   |          public.resumes           |
-|--------------------|   |-----------------------------------|
-| user_id UUID  <PK> |   | id            UUID  <PK>          |
-| headline TEXT      |   | user_id       UUID  <FK>          |
-| skills   TEXT[]    |   | filename      TEXT                |
-| experience_years   |   | storage_path  TEXT                |
-| preferred_roles    |   | file_size     INTEGER             |
-| embedding  vec(384)|   | mime_type     TEXT                |
-| content_hash TEXT  |   | raw_text      TEXT                |
-| raw_json   JSONB   |   | is_active     BOOLEAN (DEFAULT tr)|
-| updated_at TIMESTZ |   | created_at    TIMESTAMPTZ         |
-+--------------------+   +-----------------------------------+
-                                   |
-                                   | 1:N
-                                   v
-                         +-----------------------------------+
-                         |          public.matches           |
-                         |-----------------------------------|
-                         | id             UUID  <PK>         |
-                         | user_id        UUID  <FK>         |
-                         | job_id         TEXT  <FK> -----+  |
-                         | match_score    INTEGER         |  |
-                         | matched_skills TEXT[]          |  |
-                         | missing_skills TEXT[]          |  |
-                         | explanation    TEXT            |  |
-                         | score_breakdown JSONB          |  |
-                         | created_at     TIMESTAMPTZ     |  |
-                         +-----------------------------------+
-                                                          |
-                                                          | N:1
-                                                          v
-                                         +-----------------------------------+
-                                         |           public.jobs             |
-                                         |-----------------------------------|
-                                         | id                 TEXT <PK>      |
-                                         | title              TEXT           |
-                                         | company            TEXT           |
-                                         | normalized_company TEXT           |
-                                         | normalized_title   TEXT           |
-                                         | location           TEXT           |
-                                         | region             TEXT           |
-                                         | description        TEXT           |
-                                         | source_url         TEXT           |
-                                         | required_years     INTEGER        |
-                                         | skills             TEXT[]         |
-                                         | embedding          vector(384)    |
-                                         | is_active          BOOLEAN        |
-                                         | last_seen_at       TIMESTAMPTZ    |
-                                         +-----------------------------------+
+enqueue(user_id, region, limit, attempt)
+   |  attempt 0 (a fresh request) cancels any scheduled retry for that user
+   |  user already queued or running -> ignored (in-flight set)
+   v
+asyncio.Queue -> Semaphore(2) -> execute_matching_funnel
+   |
+   '-- result.retry_after set?  attempt < 3 -> schedule a delayed re-run (delay = retry_after clamped to 5 s..1 h, plus jitter)
+                                attempt = 3 -> tracker "failed": "AI analysis is temporarily unavailable..."
 ```
 
-### Table Specifications & Index Strategies
+A retry re-runs the whole funnel, but the evaluation cache means only jobs that were never explained reach Groq.
+The semaphore bounds concurrent funnels; Groq pressure is controlled by the gateway, not by the semaphore.
 
-| Table | Index Type | Target Columns / Operator | Purpose |
-|---|---|---|---|
-| `public.jobs` | **HNSW** | `embedding vector_cosine_ops` (`m=16`, `ef_construction=64`) | Sub-millisecond ANN cosine similarity search across 10,000+ jobs |
-| `public.jobs` | **B-Tree** | `(region)` | Fast regional filtering partition |
-| `public.jobs` | **B-Tree** | `(is_active, last_seen_at)` | Fast staleness pruner and catalog maintenance |
-| `public.jobs` | **B-Tree** | `(normalized_company, normalized_title, region)` | Idempotent deduplication lookups |
-| `public.matches` | **B-Tree Unique** | `(user_id, job_id)` | Enforces single score record per job/user pair |
-| `public.matches` | **B-Tree** | `(user_id, match_score DESC)` | Fast indexed read-aside query for dashboard feed (<0.2ms) |
-| `public.resumes` | **Partial Unique**| `(user_id) WHERE is_active = true` | Guarantees at most one active resume per candidate |
+`core/task_tracker.py` keeps, per user: `status` (idle, processing, completed, failed), `progress` 0 to 100, `step_label`,
+`error`, `analysis_pending`, `retry_in`, `updated_at`. Funnel milestones: 10 validating, 25 parsing, 50 enqueued,
+55 vector search, 70 scoring, 82 LLM, 95 saving, 100 done. A finished run with missing explanations is reported as
+`completed` with `analysis_pending: true`, so the upload dialog can hand over to the dashboard, which keeps an "analysis
+in progress" state until it clears.
 
 ---
 
-## 12. Frontend Feed & Modal UX Interaction Architecture
+## 12. Upload and match lifecycle
 
-The frontend is built on Next.js 16 (App Router) and Tailwind CSS. The interface prioritizes clarity, eliminating cognitive fatigue from redundant progress bars and presenting immediate, grounded evidence.
-
-### User Interface Interaction Hierarchy
+`POST /resumes/upload` overlaps independent work:
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                                    DASHBOARD FEED                                       |
-|                                                                                         |
-|  Active Resume Banner:                                                                  |
-|  [ File: medhansh.pdf (142 KB) | Uploaded 2h ago | [Replace Resume] | [Delete Resume] ] |
-|                                                                                         |
-|  Region Selector: [ India (Default) | United States | Remote | All ]                     |
-|                                                                                         |
-|  Top 15 Ranked Match Cards Grid:                                                        |
-|  +-----------------------------------------------------------------------------------+  |
-|  | Mitratech — Associate Software Engineer                       [ Exact Match: 94% ]|  |
-|  | Hyderabad, India • Full-Time                                                      |  |
-|  | "Your RailMind and JanSamadhan projects prove strong backend API design..."       |  |
-|  | [Python] [FastAPI] [PostgreSQL] [REST]                                            |  |
-|  +-----------------------------------------------------------------------------------+  |
-|  | Coram AI — Junior Backend Developer                          [ Exact Match: 89% ]|  |
-|  | Bengaluru, India • Full-Time                                                      |  |
-|  | "Direct experience with asynchronous Python services and distributed queuing..."  |  |
-|  | [Python] [AsyncIO] [Redis] [Docker]                                               |  |
-|  +-----------------------------------------------------------------------------------+  |
-|  | getwingapp — Full Stack Engineer                             [ Broader Fit: 74% ]|  |
-|  | Remote • Full-Time                                                                |  |
-|  | "Demonstrated full-stack capabilities, but role emphasizes Vue.js over React..."  |  |
-|  | [TypeScript] [Node.js]                                                            |  |
-|  +-----------------------------------------------------------------------------------+  |
-+-----------------------------------------------------------------------------------------+
-                                             |
-                               Click Job Card|
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                                STREAMLINED JOB DETAIL MODAL                             |
-|                                                                                         |
-|  Header:                                                                                |
-|  - Role Title, Company, Location, Date Posted                                           |
-|  - Calibrated Match Percentage Badge: [ 94% Match ]                                     |
-|                                                                                         |
-|  Section 1: Grounded Match Verdict Card (Zero Hallucination)                             |
-|  +-----------------------------------------------------------------------------------+  |
-|  | Verdict:                                                                          |  |
-|  | "Your RailMind project demonstrates strong competence in architecting production  |  |
-|  | FastAPI backends and managing PostgreSQL databases. However, you lack prior       |  |
-|  | exposure to enterprise message queues like Apache Kafka."                         |  |
-|  +-----------------------------------------------------------------------------------+  |
-|                                                                                         |
-|  Section 2: Verified Strengths (Matched Skills)                                         |
-|  [ Python ]  [ FastAPI ]  [ PostgreSQL ]  [ REST APIs ]  (Green pill badges)            |
-|                                                                                         |
-|  Section 3: Missing Prerequisites & Gaps                                                 |
-|  [ Apache Kafka ]  [ Kubernetes ]  (Subtle grey dashed-border pills)                    |
-|                                                                                         |
-|  Section 4: Itemized Score Deductions                                                   |
-|  - (-4 pts) Missing Apache Kafka: Required for high-throughput event processing        |
-|  - (-2 pts) Missing Kubernetes: Preferred for microservices orchestration               |
-|                                                                                         |
-|  Section 5: Job Description Overview                                                    |
-|  - Structured duties and responsibilities extracted from posting                       |
-|  - (If Aggregator teaser: clean notice with direct apply redirection)                   |
-|                                                                                         |
-|  Footer:                                                                                |
-|  [ Close ]                                                  [ Apply on Company Site -> ]|
-+-----------------------------------------------------------------------------------------+
+read file -> validate (thread)
+   |
+   +-- start: storage upload (network, about 1.2 s)          \
+   +-- start: fetch existing profile (thread)                  } concurrent
+   +-- parse resume (thread)                                  /
+   |
+   v  enrichment only if the parser found no headline/roles and the stored result is not reusable
+   embed payload (thread; reuse the stored vector if the content hash is unchanged)
+   save profile (headline, skills, vector, content_hash, markdown_hash, ...)
+   |
+   +-- identical content AND 10 saved matches  -> bypass: 0 tokens
+   +-- otherwise: if the content changed, clear this user's matches and cached evaluations immediately
+   |             then enqueue the funnel (it only needs the profile, so it runs while the file is still uploading)
+   |
+   v  await storage upload -> save the resume record -> delete the previous file in the background -> respond
 ```
 
-### Two-Tier Match Badge Contract
+If the storage upload or the record save fails after the funnel was enqueued, the tracker is marked failed and the error
+is returned.
 
-| Badge Type | Color & Styling | Criteria |
+`GET /matches` is read-only: it reads up to 10 explained rows, applies the region view (a miss returns an empty list,
+never a re-run) and reports the state. If there are no saved matches, no run is active or scheduled, the last run finished more
+than 60 seconds ago (or none has run in this process), and the profile has skills and an embedding, it enqueues exactly
+one background run and returns `status: "processing"`.
+
+`DELETE /resumes/active` cancels the user's scheduled retry, deletes resume, matches, profile and cached evaluations in
+the database, deletes the stored file, and clears the tracker.
+
+---
+
+## 13. Database schema
+
+```
+auth.users (Supabase)
+   |1                |1                  |1
+   |                 |                   |
+   v N               v 1                 v N
+public.resumes    public.profiles      public.llm_evaluations
+ id uuid PK        user_id uuid PK      user_id uuid  FK  \
+ user_id FK        headline text        content_hash text   > PK (user_id, content_hash, job_id)
+ filename          skills text[]        job_id text         /
+ storage_path      experience_years     job_sig text
+ file_size         preferred_roles[]    evaluation jsonb
+ mime_type         embedding vector(384) created_at
+ raw_text          content_hash text
+ is_active         raw_json jsonb (sections, markdown, markdown_hash, enriched_by_llm, is_fresher, ...)
+ created_at        updated_at
+ updated_at
+
+auth.users 1 --- N public.matches ------ N:1 --- public.jobs
+                   id uuid PK                      id text PK  ("greenhouse:slug:id", "adzuna:id", ...)
+                   user_id FK                      title, company, normalized_company, normalized_title
+                   job_id FK -> jobs.id            location, region (india | us | remote)
+                   match_score int                 description (<= 1,500 chars), source_url, date_posted
+                   matched_skills text[]           required_years int, skills text[]
+                   missing_skills text[]           embedding vector(384), is_active, last_seen_at
+                   explanation text
+                   score_breakdown jsonb  (llm_pending: true marks hidden rows)
+                   created_at
+                   UNIQUE (user_id, job_id)
+```
+
+`score_breakdown` holds `math_score`, `llm_score`, `verdict`, `strengths`, `gaps`, `deductions`, the three sub-scores and
+`weights`.
+
+| Table | Index | Purpose |
 |---|---|---|
-| **`Exact Match`** | Emerald Badge (`bg-emerald-50 text-emerald-800 border-emerald-200`) | Final Score $\ge 75\%$ **AND** candidate has $\ge 3$ verified explicit matching skills |
-| **`Broader Fit`** | Zinc / Amber Badge (`bg-zinc-100 text-zinc-700 border-zinc-300`) | Final Score $< 75\%$ **OR** candidate matched via inferred transferrable skills ($< 3$ explicit skills) |
+| jobs | HNSW `embedding vector_cosine_ops` (default `m=16`, `ef_construction=64`) | nearest-neighbor retrieval |
+| jobs | btree `region`, `is_active`, `last_seen_at` | filters and housekeeping |
+| jobs | btree `(normalized_company, normalized_title, region)` | de-duplication lookups |
+| matches | btree `(user_id, match_score DESC)`; unique `(user_id, job_id)` | dashboard read and one row per pair |
+| resumes | btree `user_id`; partial unique `(user_id) WHERE is_active` | one active resume per user |
+| llm_evaluations | PK `(user_id, content_hash, job_id)`; btree `user_id` | cache lookup and purge |
+
+DDL: `scripts/migrate.py` (all tables except `llm_evaluations`, indexes, policies, `match_jobs`) and
+`apps/api/sql/llm_evaluations.sql`.
 
 ---
 
-## 13. Security Model, Isolation & Threat Mitigation
+## 14. Frontend
 
-### 1. Row Level Security (RLS) Isolation
-Every table containing candidate data (`resumes`, `profiles`, `matches`) has PostgreSQL RLS enabled. Policies strictly check `auth.uid() = user_id`. No user can query or mutate another user's files, profiles, or scores under any circumstances.
+Next.js 16 App Router, client components for the interactive pages, Tailwind v4.
 
-### 2. Service Role Key Isolation
-The Supabase `SERVICE_ROLE_KEY` is exclusively configured on the backend API and crawler environments. It is strictly never exposed to the frontend Next.js bundle (which receives only `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
+| Route | Purpose |
+|---|---|
+| `/` | Email and password sign in or sign up (Supabase). Signed-in users are redirected to `/dashboard`. |
+| `/dashboard` | Matches feed, processing state, upload dialog, job modal |
+| `/resume` | Active resume: download via signed URL, replace, delete (with confirmation) |
+| `/upload` | Redirects to `/dashboard` |
+| `/api/backend/[...path]` | Proxy to FastAPI for GET, POST, PUT, PATCH and DELETE; attaches the session access token |
 
-### 3. Isolated Storage Buckets
-Candidate resumes are stored in private Supabase Storage at paths formatted as `resumes/{user_id}/{safe_filename}`. Download URLs are pre-signed with a 15-minute expiration window.
+`middleware.ts` refreshes the session and redirects unauthenticated requests to `/`.
 
-### 4. Input Sanitization & Path Traversal Guards
-All uploaded filenames are stripped of non-alphanumeric characters, parent directory tokens (`..`), and null bytes (`\0`). Documents undergo strict magic byte validation to prevent MIME-type spoofing.
+**Dashboard states** (driven by `GET /matches` and `GET /matches/status`):
+
+```
+no resume                       -> "No active resume found" + upload button
+loading                         -> 3 skeleton cards
+processing, no matches yet      -> "AI analysis in progress" panel with the live step label
+matches + analysis pending      -> cards plus a slim "Finishing AI analysis for more roles..." note
+failed, no matches              -> message from the server + "Try again"
+ready                           -> up to 10 cards
+```
+
+While analysis is pending the dashboard polls `/matches/status` with backoff (3 s growing to 10 s, or slowly when a retry
+is scheduled), skips polling while the tab is hidden, stops after 10 minutes, and refetches matches once when the run
+finishes. The upload dialog polls every 500 ms for up to 48 s and closes 250 ms after completion. `JobCard` is memoized and
+the select handler is stable.
+
+**Cards and modal.** A match is an "Exact Match" when the score is at least 75 and at least 3 matched skills; otherwise
+"Broader Fit". The modal shows the AI verdict (hidden if empty), strengths, gaps, itemized deductions and the job
+description, with an apply link.
+
+---
+
+## 15. Security
+
+- **Authentication.** The API validates the Supabase JWT on every route except `/health`: ES256 or RS256 through the
+  project's JWKS endpoint, HS256 through `SUPABASE_JWT_SECRET`; audience `authenticated`, 60 s leeway.
+- **Authorization.** The API connects to Postgres with `DATABASE_URL` as the database owner (RLS does not apply to it) and
+  scopes every query by the verified `user_id`. RLS is enabled everywhere as defense in depth: `resumes`, `profiles` and
+  `matches` allow only `auth.uid() = user_id`; `jobs` is readable by authenticated users; `llm_evaluations` has RLS with
+  no policies, so clients cannot read it.
+- **Storage.** Private bucket `resumes`, object path `{user_id}/{random-uuid}.{ext}`, signed download URLs valid 1 hour.
+  The service-role key exists only on the backend.
+- **CORS.** Allowed origins come from `CORS_ORIGINS` (default: `http://localhost:3000`, `http://127.0.0.1:3000`); methods GET, POST,
+  DELETE, OPTIONS; headers `Authorization` and `Content-Type`; no credentials. Browsers reach the API only through the Next.js
+  proxy, so no direct cross-origin access is needed in normal use.
+- **Configuration safety.** `SUPABASE_URL` has no default; auth and storage refuse to start without it.
+- **Input.** Five-layer validation (Section 3); filenames are never trusted; the LLM prompt never contains the user's raw
+  file name.
+- **Secrets.** `.env` files are git-ignored; `.env.example` documents every variable. Groq keys are never logged.
+
+---
+
+## 16. Performance and capacity
+
+Measured on 2026-10-05 (see the note at the top):
+
+| Operation | Time | Groq tokens |
+|---|---|---|
+| `GET /matches` (10 jobs, about 22 KB) | 100 to 250 ms | 0 |
+| `POST /resumes/upload` request | about 2.4 to 2.6 s | 0 |
+| `match_jobs` (warm) | 0.17 to 0.45 s | 0 |
+| Scoring 100 jobs | about 2 ms | 0 |
+| Groq rerank call (12 jobs) | about 1.9 to 2.3 s | 3.0 to 3.3k |
+| Funnel from cache | about 0.7 to 1 s | 0 |
+| Changed resume, upload to results | about 3 s | one call |
+| Identical re-upload with saved matches | no funnel | 0 |
+
+Event-loop behavior: with the gateway pre-built at startup, no step of the funnel blocks the loop for more than 50 ms.
+
+Capacity (Groq free plan, `gpt-oss-20b`, per organization): 30 requests/min, 1K requests/day, 8K tokens/min, 200K
+tokens/day. At about 3.2k tokens per fresh run that is roughly 60 fresh runs per organization per day; cached runs are free.
+The 8K tokens/min limit means a second fresh run inside the same minute waits or is deferred (the user sees "analysis in
+progress" and the worker retries).
+
+---
+
+## 17. Known limitations
+
+- **In-memory state.** Queue, in-flight set, retry timers and the progress tracker are per process. Use one Uvicorn worker;
+  scheduled retries are lost on restart (the next `GET /matches` re-enqueues when nothing is saved).
+- **Shared Groq budget.** Keys from the same organization share limits. No second model is configured, although limits are per model.
+- **Truncated, whitespace-collapsed descriptions** (1,500 characters) limit skill extraction and JD structure; about a
+  quarter of the catalog has no tagged skills (a one-time LLM backfill script exists for India and remote jobs).
+- **No LICENSE file** and no deployment configuration beyond the crawler workflow.

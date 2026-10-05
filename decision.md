@@ -795,3 +795,37 @@ Replaced ambiguous metrics with a first-principles 3-dimension evaluation rubric
   - **Gaps:** Displayed as subtle greyed-out dashed badges (`bg-zinc-100 text-zinc-500 border-zinc-200`).
   - **Itemized Deductions:** Clean list with transparent point subtractions and reasons.
 
+
+
+---
+
+## Step 5: Groq gateway, evaluation cache and explained-only top 10 (2026-10-05)
+
+This step supersedes parts of Step 4 (Top 15 finalists, `llama-3.3-70b-versatile`, 6,000 TPM budget assumptions,
+two parallel chunks, per-job deterministic fallback shown to users). `README.md` and `architecture.md` describe the current system.
+
+### 11. Decisions
+
+1. **Explained-only top 10.** The LLM evaluates the top 12 candidates in one call; one small top-up call runs if fewer than
+   10 came back. Only jobs with an LLM verdict are ever shown (max 10). Unexplained candidates are stored hidden
+   (`score_breakdown.llm_pending`) and retried by the worker (max 3, delay from `Retry-After`).
+2. **One Groq gateway.** All calls (rerank, profile enrichment, backfill) go through `groq_gateway.py`: per-key RPM/TPM
+   limiter, cooldowns, `Retry-After`, org-aware cooldown, error classes (unavailable / truncated / bad response). No
+   cross-model fallback; truncation shrinks the batch instead. Reasoning is set to `low`.
+3. **Per-resume evaluation cache** `public.llm_evaluations(user_id, content_hash, job_id)`, validated by a job signature,
+   purged on resume replace or delete. Reruns and identical re-uploads cost 0 tokens.
+4. **Read-only `GET /matches`.** It never runs the funnel in a request; it enqueues one deduplicated background run when
+   nothing is saved.
+5. **Live fallback only when `match_jobs` returns fewer than 10 rows**, with no LLM skill extraction (it was never persisted
+   and re-paid every run). Skills and `required_years` are extracted from the full text before truncation.
+6. **Changed resume content clears old matches immediately** (instant replace). Stage-and-swap and "deterministic
+   explanation first, LLM upgrade later" were discussed and parked: with two separate Groq organizations the recompute
+   takes about 3 seconds and the retry path covers rate limits.
+7. **Latency:** funnel starts while the file is still uploading, old stored file deleted in the background, blocking work in
+   threads, startup warm-up of the database pool, Groq clients and embedding model.
+8. **Job description parsing** no longer splits on hyphens and recovers colon-terminated headings from whitespace-collapsed text.
+
+### Operational finding
+
+Groq limits are per organization. Keys created in the same organization share one budget (200K tokens/day on the free
+plan for `gpt-oss-20b`); a second key only adds capacity when it belongs to a different organization.
