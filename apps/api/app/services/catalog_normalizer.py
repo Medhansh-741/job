@@ -74,7 +74,11 @@ SKILLS_TAXONOMY = {
     "android": ["android"], "ios": ["ios"], "react native": ["react native"], "flutter": ["flutter"],
     "figma": ["figma"], "ui/ux": ["ui/ux", "ux", "ui design", "user experience", "design systems"],
     "three.js": ["three.js", "threejs", "webgl"], "framer": ["framer", "gsap"],
-    "testing": ["unit testing", "pytest", "jest", "cypress", "selenium", "test automation", "qa"],
+    "testing": ["unit testing", "pytest", "jest", "cypress", "selenium", "test automation", "qa", "sdet", "automated testing"],
+    "devops": ["devops", "sre", "site reliability engineering", "site reliability"],
+    "oracle": ["oracle", "pl/sql", "plsql"],
+    "servicenow": ["servicenow"],
+    "salesforce": ["salesforce", "apex"],
     "agile": ["agile", "scrum"], "system design": ["system design", "distributed systems", "scalable"],
     "algorithms": ["data structures", "algorithms", "dsa"], "oop": ["oop", "object-oriented"],
     "security": ["security", "cybersecurity", "authentication", "oauth", "jwt"],
@@ -135,12 +139,14 @@ def extract_skills(text: str) -> List[str]:
 
 
 def strip_html_and_truncate(text: str, limit: int = 1500) -> str:
-    """Strips HTML tags, unescapes entities, collapses whitespace, and limits character length."""
+    """Strips HTML tags, unescapes entities, collapses whitespace, strips leading preview dots, and limits character length."""
     if not text:
         return ""
     unescaped = html.unescape(html.unescape(text))
     stripped = HTML_TAG_PATTERN.sub(" ", unescaped)
     collapsed = re.sub(r"\s+", " ", stripped).strip()
+    # Strip leading ellipses/periods/dashes from aggregator preview teasers
+    collapsed = re.sub(r"^[\s\.\…\-]+", "", collapsed).strip()
     return collapsed[:limit]
 
 

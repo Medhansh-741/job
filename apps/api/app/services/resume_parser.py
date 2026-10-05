@@ -70,8 +70,12 @@ DATE_RANGE_PATTERN = re.compile(
 )
 
 
-INTERN_ROLE_RE = re.compile(
-    r"\b(intern|internship|trainee|apprentice|fellow)\b",
+INTERN_FREELANCE_RE = re.compile(
+    r"\b(intern|internship|trainee|apprentice|fellow|freelance|contract|contractor|project|student)\b",
+    re.IGNORECASE,
+)
+FULL_TIME_RE = re.compile(
+    r"\b(full[-\s]?time|fte|permanent)\b",
     re.IGNORECASE,
 )
 
@@ -126,7 +130,11 @@ def _parse_month_year(date_str: str) -> Optional[Tuple[int, int]]:
 
 def calculate_experience_breakdown(experience_text: str) -> Tuple[float, int, bool]:
     """Calculates full-time work experience (years), internship duration (months),
-    and whether the candidate is strictly a fresher/entry-level (< 1.0 yr full-time).
+    and whether the candidate is strictly a fresher/entry-level.
+    
+    Fresher-First Invariant:
+    A candidate role is strictly treated as internship / project experience (Fresher) UNLESS
+    it explicitly indicates full-time corporate employment ('full-time', 'full time', 'fte', 'permanent').
     """
     if not experience_text:
         return 0.0, 0, True
@@ -153,12 +161,12 @@ def calculate_experience_breakdown(experience_text: str) -> Tuple[float, int, bo
                 start_m = start_dt[0] * 12 + start_dt[1]
                 end_m = end_dt[0] * 12 + end_dt[1]
                 if end_m >= start_m:
-                    # Check context: current line and previous 2 lines for intern keywords
                     context_window = " ".join(lines[max(0, idx - 2): idx + 1])
-                    if INTERN_ROLE_RE.search(context_window):
-                        intern_intervals.append((start_m, end_m))
-                    else:
+                    # Strictly require explicit full-time indicator; otherwise count as practical intern/project experience
+                    if FULL_TIME_RE.search(context_window) and not INTERN_FREELANCE_RE.search(context_window):
                         full_time_intervals.append((start_m, end_m))
+                    else:
+                        intern_intervals.append((start_m, end_m))
 
     def _merge_and_sum(intervals: List[Tuple[int, int]]) -> int:
         if not intervals:
