@@ -188,16 +188,22 @@ export function UploadModal({
             } else if (statusData.status === "completed") {
               if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
               setProgress(100);
-              setStepLabel("Matches ready! Loading your dashboard...");
+              // The AI step can finish late (rate limit / slow service): say so instead of claiming matches are ready
+              const aiStillPending = Boolean(statusData.analysis_pending);
+              setStepLabel(
+                aiStillPending
+                  ? "Resume saved. The AI service is slow right now, so your matches will appear on the dashboard shortly."
+                  : "Matches ready! Loading your dashboard..."
+              );
 
-              // Brief hold so the 100% milestone registers without making the user wait
+              // Brief hold so the message registers; a little longer when the user needs to read the delay notice
               setTimeout(() => {
                 setIsProcessing(false);
                 onClose();
                 if (onUploadSuccess) {
                   onUploadSuccess();
                 }
-              }, 250);
+              }, aiStillPending ? 1600 : 250);
             } else if (statusData.status === "failed") {
               if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
               setIsProcessing(false);

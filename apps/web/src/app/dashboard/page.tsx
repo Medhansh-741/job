@@ -28,6 +28,8 @@ function DashboardContent() {
   // True while the backend is still producing (or retrying) AI explanations for matches
   const [analysisPending, setAnalysisPending] = React.useState<boolean>(false);
   const [analysisLabel, setAnalysisLabel] = React.useState<string>("");
+  // Seconds until the server retries a rate-limited/slow AI call (null = nothing scheduled)
+  const [retryIn, setRetryIn] = React.useState<number | null>(null);
   const [matchesError, setMatchesError] = React.useState<string | null>(null);
 
   const fetchMatches = React.useCallback(async (targetRegion: string = "india") => {
@@ -38,7 +40,9 @@ function DashboardContent() {
       });
       if (res.ok) {
         const data = await res.json();
-        setAnalysisPending(data.status === "processing" || Boolean(data.analysis_pending));
+        const pending = data.status === "processing" || Boolean(data.analysis_pending);
+        setAnalysisPending(pending);
+        if (!pending) setRetryIn(null);
         setMatchesError(data.status === "failed" ? data.error || "Match analysis failed." : null);
         const rawMatches = data.matches || [];
         const formatted: Job[] = rawMatches.map((m: any) => ({
@@ -119,6 +123,7 @@ function DashboardContent() {
             const status = await res.json();
             if (cancelled) return;
             setAnalysisLabel(status.step_label || "");
+            setRetryIn(typeof status.retry_in === "number" ? status.retry_in : null);
             const stillWorking = status.status === "processing" || Boolean(status.analysis_pending);
             if (!stillWorking) {
               await fetchMatches("india");
@@ -284,12 +289,17 @@ function DashboardContent() {
 
             {filteredJobs.length === 0 && analysisPending ? (
               <div className="rounded-xl border border-zinc-200 bg-white p-8 sm:p-12 text-center space-y-2">
-                <div className="mx-auto h-1.5 w-40 overflow-hidden rounded-full bg-zinc-100">
-                  <div className="h-full w-1/2 rounded-full bg-zinc-400 animate-pulse" />
-                </div>
-                <p className="text-sm font-medium text-zinc-900">AI analysis in progress</p>
-                <p className="text-xs text-zinc-500">
-                  {analysisLabel || "Evaluating your best matches. This page updates automatically."}
+                <div
+                  className="mx-auto h-5 w-5 animate-spin rounded-full border-2 border-zinc-200 border-t-zinc-700"
+                  aria-hidden="true"
+                />
+                <p className="text-sm font-medium text-zinc-900">
+                  {retryIn !== null ? "The AI is taking longer than usual" : "AI analysis in progress"}
+                </p>
+                <p className="text-xs text-zinc-500 max-w-md mx-auto">
+                  {retryIn !== null
+                    ? `The AI service is slow or busy right now. We are retrying automatically in about ${Math.max(1, Math.round(retryIn))} seconds. You do not need to refresh this page.`
+                    : analysisLabel || "Evaluating your best matches. This usually takes under 10 seconds."}
                 </p>
               </div>
             ) : filteredJobs.length === 0 && matchesError ? (

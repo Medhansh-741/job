@@ -333,7 +333,7 @@ chat_json(messages, max_tokens, purpose, max_wait)
    |  cooldown timestamp, x-ratelimit-remaining/reset headers
    |  reserve capacity, wait if needed (> max_wait -> LLMUnavailable)
    v
- POST (timeout 20 s, at most 2 requests in flight)
+ POST (timeout 10 s, at most 2 requests in flight)
    |
    +-- 200  -> finish_reason "length" or invalid JSON -> LLMTruncated ; else parsed result
    +-- 429  -> cooldown = Retry-After; if the error names an organization, cool down every key of that org
@@ -343,6 +343,10 @@ chat_json(messages, max_tokens, purpose, max_wait)
    +-- 401/403 -> key disabled
    +-- 5xx / timeout -> short cooldown, retry once
 ```
+
+Worst case for a stuck request is about 22 s (10 s timeout, 2 s cooldown, one 10 s retry), after which the worker retries
+within a few seconds. With a single key the "other key" retry is the same key, so a second key from a different
+organization is what removes rate-limit waits.
 
 Every attempt logs purpose, key label, status, latency, tokens and remaining-token headers; the key itself is never
 logged. Rate limits are per organization and per model, so two keys help only if they belong to different
@@ -361,7 +365,7 @@ enqueue(user_id, region, limit, attempt)
    v
 asyncio.Queue -> Semaphore(2) -> execute_matching_funnel
    |
-   '-- result.retry_after set?  attempt < 3 -> schedule a delayed re-run (delay = retry_after clamped to 5 s..1 h, plus jitter)
+   '-- result.retry_after set?  attempt < 3 -> schedule a delayed re-run (delay = retry_after clamped to 3 s..1 h, plus up to 1 s of jitter)
                                 attempt = 3 -> tracker "failed": "AI analysis is temporarily unavailable..."
 ```
 
@@ -468,7 +472,7 @@ Next.js 16 App Router, client components for the interactive pages, Tailwind v4.
 |---|---|
 | `/` | Email and password sign in or sign up (Supabase). Signed-in users are redirected to `/dashboard`. |
 | `/dashboard` | Matches feed, processing state, upload dialog, job modal |
-| `/resume` | Active resume: download via signed URL, replace, delete (with confirmation) |
+| `/resume` | Active resume: download via signed URL, replace, delete (with confirmation). Every upload button on every page (sidebar, dashboard empty state, resume header, resume empty state) opens the same upload dialog |
 | `/upload` | Redirects to `/dashboard` |
 | `/api/backend/[...path]` | Proxy to FastAPI for GET, POST, PUT, PATCH and DELETE; attaches the session access token |
 
@@ -479,7 +483,8 @@ Next.js 16 App Router, client components for the interactive pages, Tailwind v4.
 ```
 no resume                       -> "No active resume found" + upload button
 loading                         -> 3 skeleton cards
-processing, no matches yet      -> "AI analysis in progress" panel with the live step label
+processing, no matches yet      -> spinner + "AI analysis in progress" with the live step label; while a retry is
+                                   scheduled: "The AI is taking longer than usual" + retry countdown message
 matches + analysis pending      -> cards plus a slim "Finishing AI analysis for more roles..." note
 failed, no matches              -> message from the server + "Try again"
 ready                           -> up to 10 cards
@@ -487,7 +492,8 @@ ready                           -> up to 10 cards
 
 While analysis is pending the dashboard polls `/matches/status` with backoff (3 s growing to 10 s, or slowly when a retry
 is scheduled), skips polling while the tab is hidden, stops after 10 minutes, and refetches matches once when the run
-finishes. The upload dialog polls every 500 ms for up to 48 s and closes 250 ms after completion. `JobCard` is memoized and
+finishes. The upload dialog polls every 500 ms for up to 48 s and closes 250 ms after completion (1.6 s, with an explanatory
+message, when the AI step is still pending). `JobCard` is memoized and
 the select handler is stable.
 
 **Cards and modal.** A match is an "Exact Match" when the score is at least 75 and at least 3 matched skills; otherwise

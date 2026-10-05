@@ -77,7 +77,10 @@ class TaskTracker:
             user_id=user_id,
             status="completed",
             progress=100,
-            step_label=f"Finishing AI analysis ({explained} ready)...",
+            step_label=(
+                f"The AI service is slow or busy right now. Retrying automatically in about {max(1, int(round(retry_in)))} seconds"
+                + (f" ({explained} matches ready so far)." if explained else ".")
+            ),
             error=None,
             analysis_pending=True,
             retry_in=retry_in,

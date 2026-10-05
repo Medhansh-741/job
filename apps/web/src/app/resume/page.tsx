@@ -4,7 +4,6 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { Sidebar } from "@/components/dashboard/sidebar";
 import { UploadModal } from "@/components/dashboard/upload-modal";
-import { FileDropzone } from "@/components/ui/file-dropzone";
 import { Button } from "@/components/ui/button";
 
 interface ResumeItem {
@@ -32,11 +31,6 @@ export default function ResumePage() {
   const [confirmDelete, setConfirmDelete] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-
-  // Inline upload state for empty view
-  const [inlineFile, setInlineFile] = React.useState<File | null>(null);
-  const [inlineUploading, setInlineUploading] = React.useState(false);
-  const [inlineError, setInlineError] = React.useState<string | null>(null);
 
   const fetchActiveResume = React.useCallback(async () => {
     try {
@@ -104,65 +98,6 @@ export default function ResumePage() {
       return;
     }
     window.open(activeResume.downloadUrl, "_blank", "noopener,noreferrer");
-  };
-
-  const handleInlineFileSelect = (file: File) => {
-    const validExtensions = [".pdf", ".docx"];
-    const hasValidExt = validExtensions.some((ext) =>
-      file.name.toLowerCase().endsWith(ext)
-    );
-
-    if (!hasValidExt) {
-      setInlineError("Please select a valid PDF or DOCX file.");
-      setInlineFile(null);
-      return;
-    }
-
-    if (file.size === 0) {
-      setInlineError("The selected file is empty (0 bytes).");
-      setInlineFile(null);
-      return;
-    }
-
-    if (file.size > 5 * 1024 * 1024) {
-      setInlineError("File exceeds maximum allowed size of 5MB.");
-      setInlineFile(null);
-      return;
-    }
-
-    setInlineError(null);
-    setInlineFile(file);
-  };
-
-  const handleInlineUpload = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inlineFile || inlineUploading) return;
-
-    setInlineUploading(true);
-    setInlineError(null);
-
-    try {
-      const formData = new FormData();
-      formData.append("file", inlineFile);
-
-      const res = await fetch("/api/backend/resumes/upload", {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        const msg = data?.detail?.message || data?.detail || "Validation failed";
-        setInlineError(typeof msg === "string" ? msg : JSON.stringify(msg));
-      } else {
-        setInlineFile(null);
-        await fetchActiveResume();
-      }
-    } catch {
-      setInlineError("Network error: Unable to upload resume.");
-    } finally {
-      setInlineUploading(false);
-    }
   };
 
   return (
@@ -351,7 +286,7 @@ export default function ResumePage() {
               </div>
             </div>
           ) : (
-            /* Empty State with Integrated Dropzone */
+            /* Empty State: same upload dialog (live progress, lock, status polling) as every other upload button */
             <div className="rounded-xl border border-zinc-200 bg-white p-6 sm:p-8 shadow-xs max-w-lg mx-auto space-y-5">
               <div className="text-center space-y-1">
                 <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-zinc-700 mb-3">
@@ -376,31 +311,9 @@ export default function ResumePage() {
                 </p>
               </div>
 
-              <form onSubmit={handleInlineUpload} className="space-y-4">
-                {inlineError && (
-                  <div className="rounded-md border border-red-200 bg-red-50 p-2.5 text-xs text-red-700 leading-relaxed">
-                    {inlineError}
-                  </div>
-                )}
-
-                <FileDropzone
-                  selectedFile={inlineFile}
-                  onFileSelect={handleInlineFileSelect}
-                  onRemoveFile={() => {
-                    setInlineFile(null);
-                    setInlineError(null);
-                  }}
-                />
-
-                <Button
-                  type="submit"
-                  disabled={!inlineFile}
-                  isLoading={inlineUploading}
-                  className="w-full h-9 text-xs"
-                >
-                  {inlineUploading ? "Validating & Storing..." : "Save Resume"}
-                </Button>
-              </form>
+              <Button className="w-full h-9 text-xs" onClick={() => setUploadModalOpen(true)}>
+                Upload Resume
+              </Button>
             </div>
           )}
         </div>

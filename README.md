@@ -213,7 +213,7 @@ API docs: `http://localhost:8000/docs`. App: `http://localhost:3000` (sign up, u
 | `GROQ_API_KEY_FALLBACK` | API | Optional second key. Only adds capacity if it belongs to a **different Groq organization**. |
 | `GROQ_MODEL` | API | `openai/gpt-oss-20b` |
 | `GROQ_RPM` / `GROQ_TPM` | API | `25` / `6500` per key (local limiter, kept under the free-tier 30 RPM / 8K TPM). |
-| `GROQ_TIMEOUT` | API | `20` seconds per request |
+| `GROQ_TIMEOUT` | API | `10` seconds per request (a normal rerank call takes about 2 s) |
 | `GROQ_REASONING_EFFORT` | API | `low`. Removed automatically if the model rejects it. |
 | `GROQ_INCLUDE_REASONING` | API | `false` |
 | `GROQ_MAX_INFLIGHT` | API | `2` concurrent Groq requests |

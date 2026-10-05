@@ -34,7 +34,7 @@ logger.setLevel(logging.INFO)
 
 MAX_LLM_CALLS_PER_RUN = 4          # initial + top-up + at most two shrink splits
 TOPUP_MAX_JOBS = 6
-DEFAULT_RETRY_AFTER = 45.0
+DEFAULT_RETRY_AFTER = 10.0   # unusable/truncated answers are usually transient: retry soon, not in 45 s
 TOKENS_PER_JOB = 170               # output budget per evaluated job (verdict + lists + 3 scores)
 TOKENS_BASE = 350
 

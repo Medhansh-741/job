@@ -24,7 +24,7 @@ logger = logging.getLogger("matching_worker")
 logger.setLevel(logging.INFO)
 
 MAX_RETRIES = 3
-MIN_RETRY_DELAY = 5.0
+MIN_RETRY_DELAY = 3.0
 MAX_RETRY_DELAY = 3600.0
 
 
@@ -86,7 +86,7 @@ class MatchingWorker:
         return True
 
     def _schedule_retry(self, user_id: str, region: str, limit: int, attempt: int, retry_after: float) -> None:
-        delay = min(max(retry_after, MIN_RETRY_DELAY), MAX_RETRY_DELAY) + random.uniform(0.0, 3.0)
+        delay = min(max(retry_after, MIN_RETRY_DELAY), MAX_RETRY_DELAY) + random.uniform(0.0, 1.0)
         self.cancel_retry(user_id)
 
         async def _later() -> None:
