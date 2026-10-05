@@ -127,17 +127,22 @@ def score_job(
     """Computes Phase 4.2 deterministic math score with Bayesian Denominator Floor."""
     s_norm = normalize_semantic_similarity(raw_sim)
     cov, matched, missing = calculate_skill_coverage(candidate_skills, job_skills)
-
-    # Dynamic Fallback: When a job has 0 tagged skills, skill coverage defaults to semantic score
-    effective_cov = s_norm if cov is None else cov
-
-    title_boost = calculate_title_boost(preferred_roles, headline, job_title, normalized_title)
-    base_score = 0.40 * s_norm + 0.60 * effective_cov + title_boost
-
     job_skills_len = len(job_skills) if job_skills else 0
-    dampener = calculate_reality_dampener(cov, job_skills_len)
+    title_boost = calculate_title_boost(preferred_roles, headline, job_title, normalized_title)
 
-    final_score = int(round(min(100.0, max(0.0, base_score * dampener * 100.0))))
+    if cov is None or job_skills_len == 0:
+        # Dual-Track Safeguard: Job has 0 tagged skills.
+        # Score based purely on semantic similarity + title boost, capped at 65 max.
+        base_score = 0.70 * s_norm + title_boost
+        dampener = 1.0
+        final_score = int(round(min(65.0, max(0.0, base_score * 100.0))))
+        effective_cov = 0.0
+    else:
+        # Standard Track: Job has explicit technical skills.
+        effective_cov = cov
+        base_score = 0.40 * s_norm + 0.60 * effective_cov + title_boost
+        dampener = calculate_reality_dampener(cov, job_skills_len)
+        final_score = int(round(min(100.0, max(0.0, base_score * dampener * 100.0))))
 
     return {
         "match_score": final_score,
@@ -282,7 +287,7 @@ async def execute_matching_funnel(
                 **audit,
             })
 
-    # 5. Stage 5: Deterministic Sort & Cardinality Truncation (Top 15 Finalists)
+    # 5. Stage 5: Deterministic Sort & Diversity-Constrained Truncation (Top 15 Finalists)
     # Sort order: match_score DESC, date_posted DESC, id ASC
     def sort_key(item):
         score = item["match_score"]
@@ -290,7 +295,21 @@ async def execute_matching_funnel(
         return (score, date_str, item["id"])
 
     scored_jobs.sort(key=sort_key, reverse=True)
-    top_finalists = scored_jobs[:limit]
+
+    # Diversity Invariant: At most 2 postings per company to prevent feed cannibalization
+    company_counts: Dict[str, int] = {}
+    top_finalists: List[Dict[str, Any]] = []
+
+    for job in scored_jobs:
+        comp_key = (job.get("normalized_company") or job.get("company") or "unknown").lower().strip()
+        current_count = company_counts.get(comp_key, 0)
+        if current_count >= 2:
+            continue
+
+        company_counts[comp_key] = current_count + 1
+        top_finalists.append(job)
+        if len(top_finalists) >= limit:
+            break
 
     # 6. Stage 4.3: Groq LLM Cross-Attention Re-Ranking & Calibration
     calibrated_matches = await rerank_finalists_with_llm(

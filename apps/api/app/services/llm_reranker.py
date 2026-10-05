@@ -47,21 +47,50 @@ def _extract_projects_from_text(projects_content: str) -> List[Dict[str, Any]]:
     """Extracts structured project items with names and summaries from resume text."""
     if not projects_content:
         return []
+
+    stop_headings = [
+        "experience & leadership", "experience", "work experience",
+        "leadership", "positions of responsibility", "extracurricular",
+        "education", "skills", "achievements"
+    ]
     projects = []
     lines = [l.strip() for l in projects_content.split("\n") if l.strip()]
     current_proj = None
+
     for line in lines:
-        if line.startswith(("•", "*")) or (line.startswith("-") and not line.startswith("- ")):
-            if current_proj and len(current_proj["summary"]) < 140:
-                current_proj["summary"] += " " + line.lstrip("•-* ").strip()
-        elif any(sep in line for sep in ["|", "–", "—", " - ", ":"]) and len(line) < 100:
-            name = re.split(r"[|–—:]|\s-\s", line)[0].strip()
-            current_proj = {"name": name, "summary": ""}
-            projects.append(current_proj)
-            if len(projects) >= 4:
-                break
-        elif current_proj and not current_proj["summary"]:
-            current_proj["summary"] = line[:140]
+        lower = line.lower()
+        if any(lower == h or lower.startswith(h + " ") for h in stop_headings):
+            break
+
+        # Check for bullet: starts with standard bullet chars, replacement chars, or numbers
+        is_bullet = (
+            line[0] in ("\ufffd", "•", "*", "-", "·", "▪", "▫", "○", "●")
+            or bool(re.match(r"^(\([a-zA-Z0-9]+\)|\[[0-9]+\]|[0-9]+\.)\s", line))
+        )
+
+        if not is_bullet:
+            parts = re.split(r"\s+[|–—\ufffd•·]\s+|\s+-\s+", line)
+            if len(parts) >= 2:
+                p_name = parts[0].strip("•*-–—·▪▫○● \t\ufffd")
+                p_name = re.sub(r"^(Project:?|Name:?)\s*", "", p_name, flags=re.I).strip()
+                rest = " ".join(parts[1:])
+                has_anchor = bool(re.search(r"(github|live|demo|20\d\d|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|python|react|next\.?js|fastapi|node|c\+\+|pytorch|ai|ml|typescript|javascript)", rest, re.I))
+                starts_capital = bool(re.match(r"^[A-Z][a-zA-Z0-9\s]{2,}", p_name))
+                if starts_capital and (has_anchor or len(p_name) <= 40) and not any(h in p_name.lower() for h in stop_headings):
+                    current_proj = {"name": p_name, "summary": ""}
+                    projects.append(current_proj)
+                    if len(projects) >= 5:
+                        break
+                    continue
+
+        if current_proj and is_bullet:
+            text = line.lstrip("•*-–—·▪▫○● \t\ufffd(cid:0123456789)")
+            if len(current_proj["summary"]) < 200:
+                if current_proj["summary"]:
+                    current_proj["summary"] += " " + text
+                else:
+                    current_proj["summary"] = text
+
     return projects
 
 
@@ -73,18 +102,24 @@ def _extract_experience_from_text(exp_content: str) -> List[Dict[str, Any]]:
     lines = [l.strip() for l in exp_content.split("\n") if l.strip()]
     current_exp = None
     for line in lines:
-        if line.startswith(("•", "*")) or (line.startswith("-") and not line.startswith("- ")):
-            if current_exp and len(current_exp["summary"]) < 140:
-                current_exp["summary"] += " " + line.lstrip("•-* ").strip()
-        elif any(sep in line for sep in ["|", "–", "—", "@", "at ", " - ", ":"]) and len(line) < 100:
-            parts = re.split(r"[|–—:]|\s-\s", line)
-            title = parts[0].strip()
-            current_exp = {"role_and_company": title, "summary": ""}
-            experiences.append(current_exp)
-            if len(experiences) >= 3:
-                break
+        is_bullet = (
+            line[0] in ("\ufffd", "•", "*", "-", "·", "▪")
+            or bool(re.match(r"^(\([a-zA-Z0-9]+\)|\[[0-9]+\]|[0-9]+\.)\s", line))
+        )
+        if is_bullet:
+            if current_exp and len(current_exp["summary"]) < 180:
+                text = line.lstrip("•*-–—·▪ \t\ufffd")
+                current_exp["summary"] += (" " + text) if current_exp["summary"] else text
+        elif any(sep in line for sep in ["|", "–", "—", "@", "at ", " - ", "\ufffd"]) and len(line) < 120:
+            parts = re.split(r"\s+[|–—\ufffd@]\s+|\s+-\s+|\s+at\s+", line)
+            title = parts[0].strip("•*-–—·▪ \t\ufffd")
+            if len(title) >= 3 and len(title) <= 70:
+                current_exp = {"role_and_company": title, "summary": ""}
+                experiences.append(current_exp)
+                if len(experiences) >= 3:
+                    break
         elif current_exp and not current_exp["summary"]:
-            current_exp["summary"] = line[:140]
+            current_exp["summary"] = line[:180]
     return experiences
 
 
@@ -185,7 +220,7 @@ def build_rerank_prompt(candidate: Dict[str, Any], compressed_jobs: List[Dict[st
     return system_prompt, user_prompt
 
 
-def calculate_blended_score(math_score: int, eval_item: Dict[str, Any]) -> Tuple[int, int, Dict[str, Any]]:
+def calculate_blended_score(math_score: int, eval_item: Dict[str, Any], has_skills: bool = True) -> Tuple[int, int, Dict[str, Any]]:
     """Calculates deterministic blended score in Python to prevent LLM arithmetic errors.
     
     Formula:
@@ -212,6 +247,10 @@ def calculate_blended_score(math_score: int, eval_item: Dict[str, Any]) -> Tuple
     total_deductions = min(15, total_deductions)
     score_llm = max(0.0, min(100.0, raw_llm - total_deductions))
     final_score = int(round(0.30 * float(math_score) + 0.70 * score_llm))
+
+    # Dual-Track Safeguard: If job had no verified skills, cap final score at 68
+    if not has_skills:
+        final_score = min(68, final_score)
 
     verdict = eval_item.get("verdict") or eval_item.get("reasoning") or (
         f"Candidate matched with verified stack alignment ({final_score}% overall fit)."
@@ -312,6 +351,7 @@ async def rerank_finalists_with_llm(
             final_score, llm_score, breakdown = calculate_blended_score(
                 math_score=job["match_score"],
                 eval_item=eval_item,
+                has_skills=bool(job.get("skills")),
             )
             # Map grounded strengths, gaps, and verdict
             strengths = eval_item.get("strengths") or eval_item.get("verified_strengths") or job.get("matched_skills") or []

@@ -21,11 +21,15 @@ from app.services.catalog_normalizer import (
 )
 from app.services.embedding_service import generate_embedding
 
+import json
+import asyncio
+
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
 JOOBLE_KEY_IN = os.getenv("JOOBLE_API_KEY_IN")
 JOOBLE_KEY_US = os.getenv("JOOBLE_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 async def fetch_adzuna_india(query: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -136,6 +140,45 @@ async def fetch_jooble(query: str, region: str = "india", limit: int = 10) -> Li
         return []
 
 
+async def extract_skills_llm(title: str, description: str) -> List[str]:
+    """Asynchronously extracts technical skills from job title and description via Groq."""
+    if not GROQ_API_KEY:
+        return []
+    prompt = f"""Extract all technical skills, programming languages, databases, and frameworks from this job description.
+Return ONLY a valid JSON object matching this schema:
+{{"skills": ["skill1", "skill2"]}}
+All skills must be lowercase canonical names (e.g., 'python', 'react', 'fastapi', 'postgresql', 'docker', 'sql').
+If none, return {{"skills": []}}.
+
+Job Title: {title}
+Description: {description[:800]}"""
+    try:
+        from app.services.llm_reranker import get_groq_client
+        client = get_groq_client()
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json={
+                "model": "openai/gpt-oss-20b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=8.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            skills = parsed.get("skills", [])
+            return sorted(list(set(
+                s.lower().strip() for s in skills 
+                if isinstance(s, str) and 1 <= len(s.strip()) <= 35
+            )))
+    except Exception as e:
+        print(f"[Live Fallback] LLM skill extraction failed: {e}")
+    return []
+
+
 async def execute_live_fallback_search(
     role_query: str,
     region: str = "india",
@@ -154,6 +197,15 @@ async def execute_live_fallback_search(
 
     if not jobs or not DATABASE_URL:
         return []
+
+    # On-the-fly LLM skill enrichment for jobs that lack skills
+    async def enrich_job_skills(job: Dict[str, Any]):
+        if len(job.get("skills") or []) < 2:
+            llm_skills = await extract_skills_llm(job["title"], job["description"])
+            if llm_skills:
+                job["skills"] = sorted(list(set((job.get("skills") or []) + llm_skills)))
+
+    await asyncio.gather(*(enrich_job_skills(j) for j in jobs))
 
     # Generate embeddings and upsert into Supabase
     conn = psycopg2.connect(DATABASE_URL)

@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.auth import get_current_user, AuthenticatedUser
 from app.services.document_validator import validate_document
 from app.services.resume_parser import parse_resume
+from app.services.profile_enricher import enrich_candidate_profile
 from app.services.embedding_service import (
     build_candidate_embedding_payload,
     resolve_candidate_embedding,
@@ -136,6 +137,17 @@ async def upload_resume(
         mime_type=doc.content_type,
         filename=original_name,
     )
+
+    # 5.1 Systematic LLM Profile Understanding & Target Role Inference if missing
+    if not parsed.headline or not parsed.preferred_roles:
+        enriched = await enrich_candidate_profile(
+            markdown=parsed.markdown,
+            skills=parsed.skills,
+        )
+        if not parsed.headline:
+            parsed.headline = enriched.get("headline")
+        if not parsed.preferred_roles:
+            parsed.preferred_roles = enriched.get("preferred_roles", [])
 
     # 6. Candidate Embedding Synthesis & Content Hash Cache Check
     existing_profile = get_candidate_profile(user.id)
