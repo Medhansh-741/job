@@ -36,7 +36,6 @@ def get_groq_client() -> httpx.AsyncClient:
     if _groq_client is None or _groq_client.is_closed or _groq_client_key != current_key:
         _groq_client_key = current_key
         _groq_client = httpx.AsyncClient(
-            http2=True,
             timeout=35.0,
             headers={
                 "Authorization": f"Bearer {current_key}",
