@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, status
+from typing import Optional
+from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.auth import get_current_user, AuthenticatedUser
 from app.services.document_validator import validate_document
@@ -19,8 +20,10 @@ from app.core.db import (
     save_candidate_profile,
     get_candidate_profile,
 )
+from app.core.worker import matching_worker, lifespan
+from app.services.matching_engine import execute_matching_funnel, get_persisted_matches
 
-app = FastAPI(title="Job Matcher API", version="0.1.0")
+app = FastAPI(title="Job Matcher API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,6 +99,8 @@ async def upload_resume(
     2. Uploads to Supabase Private Storage.
     3. Saves active resume record in DB.
     4. Deterministically parses sections, skills, experience, and stores profile.
+    5. Checks content hash cache: if identical resume & matches exist, bypasses worker.
+    6. If new or modified, enqueues background matching pass through in-process MatchingWorker.
     """
     content = await file.read()
 
@@ -169,6 +174,16 @@ async def upload_resume(
         content_hash=content_hash,
     )
 
+    # 7. Match Lifecycle Contract:
+    # If identical content hash AND user already has computed matches in DB -> bypass worker (0ms CPU, 0 tokens)
+    # If modified resume or matches missing -> enqueue background task with concurrency shield
+    existing_matches = get_persisted_matches(user.id, limit=1)
+    if is_cache_hit and existing_matches:
+        # Cache hit bypass: keep existing matches intact, 0 API tokens consumed
+        pass
+    else:
+        await matching_worker.enqueue(user_id=user.id, region="india", limit=15)
+
     return {
         "success": True,
         "active": {
@@ -192,3 +207,45 @@ async def upload_resume(
         },
         "characters_extracted": len(doc.extracted_text),
     }
+
+
+@app.get("/matches")
+async def get_matches(
+    region: Optional[str] = Query("india", description="Target region: india, us, remote, or all"),
+    limit: Optional[int] = Query(15, ge=1, le=100, description="Max matches to return"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Returns user's top matches.
+    Fast path: returns persisted matches from public.matches (< 2ms).
+    Cold path: executes matching funnel if public.matches is empty.
+    """
+    persisted = get_persisted_matches(user.id, limit=limit or 15)
+    if persisted:
+        target_reg = region or "india"
+        if target_reg == "all":
+            filtered = persisted
+        elif target_reg == "india":
+            filtered = [m for m in persisted if m.get("region") in ("india", "remote")]
+        elif target_reg == "us":
+            filtered = [m for m in persisted if m.get("region") in ("us", "remote")]
+        elif target_reg == "remote":
+            filtered = [m for m in persisted if m.get("region") == "remote"]
+        else:
+            filtered = [m for m in persisted if m.get("region") == target_reg]
+
+        if filtered:
+            return {
+                "matches": filtered[:limit],
+                "total_evaluated": len(persisted),
+                "live_fallback_triggered": False,
+                "strong_matches_count": sum(1 for m in filtered if m["match_score"] >= 60),
+            }
+
+    # Cold path: compute and persist
+    result = await execute_matching_funnel(
+        user_id=user.id,
+        target_region=region or "india",
+        limit=limit or 25,
+    )
+    return result
