@@ -22,6 +22,7 @@ from app.core.db import (
     get_candidate_profile,
 )
 from app.core.worker import matching_worker, lifespan
+from app.core.task_tracker import task_tracker
 from app.services.matching_engine import execute_matching_funnel, get_persisted_matches
 
 app = FastAPI(title="Job Matcher API", version="0.1.0", lifespan=lifespan)
@@ -103,6 +104,12 @@ async def upload_resume(
     5. Checks content hash cache: if identical resume & matches exist, bypasses worker.
     6. If new or modified, enqueues background matching pass through in-process MatchingWorker.
     """
+    task_tracker.set_progress(
+        user.id,
+        status="processing",
+        progress=10,
+        step_label="Validating document integrity & reading content...",
+    )
     content = await file.read()
 
     # 1. 5-layer document validation (size, extension, magic bytes, zip bomb, readability)
@@ -132,6 +139,12 @@ async def upload_resume(
         await delete_resume_from_storage(old_storage_path)
 
     # 5. Deterministic Resume Parsing & Profile Structuring
+    task_tracker.set_progress(
+        user.id,
+        status="processing",
+        progress=25,
+        step_label="Parsing technical skills & structuring profile...",
+    )
     parsed = parse_resume(
         content=doc.raw_bytes,
         mime_type=doc.content_type,
@@ -140,6 +153,12 @@ async def upload_resume(
 
     # 5.1 Systematic LLM Profile Understanding & Target Role Inference if missing
     if not parsed.headline or not parsed.preferred_roles:
+        task_tracker.set_progress(
+            user.id,
+            status="processing",
+            progress=38,
+            step_label="Inferring engineering domain & target roles via LLM...",
+        )
         enriched = await enrich_candidate_profile(
             markdown=parsed.markdown,
             skills=parsed.skills,
@@ -192,8 +211,14 @@ async def upload_resume(
     existing_matches = get_persisted_matches(user.id, limit=1)
     if is_cache_hit and existing_matches:
         # Cache hit bypass: keep existing matches intact, 0 API tokens consumed
-        pass
+        task_tracker.mark_completed(user.id)
     else:
+        task_tracker.set_progress(
+            user.id,
+            status="processing",
+            progress=50,
+            step_label="Synthesizing vector embedding & enqueueing matching funnel...",
+        )
         await matching_worker.enqueue(user_id=user.id, region="india", limit=15)
 
     return {
@@ -219,6 +244,12 @@ async def upload_resume(
         },
         "characters_extracted": len(doc.extracted_text),
     }
+
+
+@app.get("/matches/status")
+async def get_matches_status(user: AuthenticatedUser = Depends(get_current_user)):
+    """Returns the live progress and status of the matching funnel for the authenticated user."""
+    return task_tracker.get_progress(user.id)
 
 
 @app.get("/matches")

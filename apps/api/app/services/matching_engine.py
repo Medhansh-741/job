@@ -23,6 +23,7 @@ from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
 
 from app.core.db import get_candidate_profile, get_db
+from app.core.task_tracker import task_tracker
 from app.services.live_fallback import execute_live_fallback_search
 from app.services.llm_reranker import rerank_finalists_with_llm
 
@@ -197,6 +198,13 @@ async def execute_matching_funnel(
     preferred_roles = profile.get("preferred_roles") or []
     headline = profile.get("headline")
 
+    task_tracker.set_progress(
+        user_id,
+        status="processing",
+        progress=55,
+        step_label="Scanning 1,000+ jobs via vector search & regional filters...",
+    )
+
     # 2. Stage 1 & Stage 2: Query PostgreSQL match_jobs stored procedure (K = 100)
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -224,6 +232,12 @@ async def execute_matching_funnel(
             catalog_rows = cur.fetchall()
 
     # 3. Stage 3: Deterministic Hybrid Scoring & Reality Dampening
+    task_tracker.set_progress(
+        user_id,
+        status="processing",
+        progress=70,
+        step_label="Evaluating skill coverage & applying seniority filters...",
+    )
     scored_jobs = []
     for r in catalog_rows:
         audit = score_job(
@@ -312,12 +326,24 @@ async def execute_matching_funnel(
             break
 
     # 6. Stage 4.3: Groq LLM Cross-Attention Re-Ranking & Calibration
+    task_tracker.set_progress(
+        user_id,
+        status="processing",
+        progress=82,
+        step_label="Cross-attention LLM evaluating top 15 finalists...",
+    )
     calibrated_matches = await rerank_finalists_with_llm(
         candidate_profile=profile,
         finalists=top_finalists,
     )
 
     # 7. Database Persistence to public.matches (Atomic Replace)
+    task_tracker.set_progress(
+        user_id,
+        status="processing",
+        progress=95,
+        step_label="Calibrating scores and saving matches...",
+    )
     if calibrated_matches:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -349,6 +375,8 @@ async def execute_matching_funnel(
                 """
                 execute_values(cur, insert_sql, insert_rows)
             conn.commit()
+
+    task_tracker.mark_completed(user_id, count=len(calibrated_matches))
 
     return {
         "matches": calibrated_matches,

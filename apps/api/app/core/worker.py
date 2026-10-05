@@ -12,6 +12,7 @@ import logging
 from typing import Tuple, Optional, Set
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from app.core.task_tracker import task_tracker
 
 logger = logging.getLogger("matching_worker")
 logger.setLevel(logging.INFO)
@@ -93,6 +94,7 @@ class MatchingWorker:
                 )
             except Exception as e:
                 logger.error("Error executing matching funnel for user_id=%s: %s", user_id, e, exc_info=True)
+                task_tracker.mark_failed(user_id, f"Matching engine error: {str(e)}")
             finally:
                 self.pending_users.discard(user_id)
                 self.queue.task_done()
