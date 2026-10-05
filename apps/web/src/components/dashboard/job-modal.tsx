@@ -27,10 +27,8 @@ export function JobModal({ job, onClose }: JobModalProps) {
   const breakdown = job.scoreBreakdown || {};
   const deductions = breakdown.deductions || [];
 
-  const explanation =
-    breakdown.verdict ||
-    job.explanation ||
-    "Strong technical alignment across core requirements.";
+  // Every surfaced job has an AI verdict (the API hides unexplained jobs); never invent one.
+  const explanation = breakdown.verdict || job.explanation || "";
 
   const strengths = job.matchedSkills.length > 0 ? job.matchedSkills : (breakdown.strengths || []);
   const gaps = (job.missingSkills && job.missingSkills.length > 0) ? job.missingSkills : (breakdown.gaps || []);
@@ -108,8 +106,8 @@ export function JobModal({ job, onClose }: JobModalProps) {
         {/* Modal Scrollable Body */}
         <div className="p-4 sm:p-6 overflow-y-auto space-y-5">
           {/* Grounded AI Match Analysis Card */}
-          <div className="rounded-xl border border-zinc-200/90 bg-zinc-50/80 p-4 space-y-2">
-            <div className="flex items-center justify-between">
+          {explanation && (
+            <div className="rounded-xl border border-zinc-200/90 bg-zinc-50/80 p-4 space-y-2">
               <div className="flex items-center gap-1.5">
                 <svg className="h-3.5 w-3.5 text-zinc-700" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
@@ -118,14 +116,11 @@ export function JobModal({ job, onClose }: JobModalProps) {
                   AI Match Analysis
                 </h3>
               </div>
-              <span className="text-[10px] text-zinc-400 font-mono tracking-tight">
-                Calibrated by LPU
-              </span>
+              <p className="text-xs sm:text-[13px] text-zinc-800 leading-relaxed font-normal">
+                {explanation}
+              </p>
             </div>
-            <p className="text-xs sm:text-[13px] text-zinc-800 leading-relaxed font-normal">
-              {explanation}
-            </p>
-          </div>
+          )}
 
           {/* Strengths & Gaps (Green Strengths, Greyed Gaps) */}
           <div className="space-y-4">

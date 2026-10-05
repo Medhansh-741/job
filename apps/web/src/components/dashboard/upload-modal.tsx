@@ -163,7 +163,7 @@ export function UploadModal({
       setStepLabel("Resume saved. Initializing matching pipeline...");
 
       let pollAttempts = 0;
-      const maxAttempts = 60; // 60 * 800ms = 48s circuit breaker
+      const maxAttempts = 96; // 96 * 500ms = 48s circuit breaker
 
       pollIntervalRef.current = setInterval(async () => {
         pollAttempts++;
@@ -190,14 +190,14 @@ export function UploadModal({
               setProgress(100);
               setStepLabel("Matches ready! Loading your dashboard...");
 
-              // Hold for 600ms so user sees the 100% completion milestone
+              // Brief hold so the 100% milestone registers without making the user wait
               setTimeout(() => {
                 setIsProcessing(false);
                 onClose();
                 if (onUploadSuccess) {
                   onUploadSuccess();
                 }
-              }, 600);
+              }, 250);
             } else if (statusData.status === "failed") {
               if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
               setIsProcessing(false);
@@ -208,7 +208,7 @@ export function UploadModal({
           // Gracefully continue on temporary network blips
           console.warn("Matching status poll hiccup, retrying...", err);
         }
-      }, 800);
+      }, 500);
     } catch {
       setIsProcessing(false);
       setError("Network or proxy error: Unable to connect to backend service.");

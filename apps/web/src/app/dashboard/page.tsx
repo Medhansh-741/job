@@ -25,13 +25,21 @@ function DashboardContent() {
   // Live jobs state from backend matching engine
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [loadingJobs, setLoadingJobs] = React.useState<boolean>(false);
+  // True while the backend is still producing (or retrying) AI explanations for matches
+  const [analysisPending, setAnalysisPending] = React.useState<boolean>(false);
+  const [analysisLabel, setAnalysisLabel] = React.useState<string>("");
+  const [matchesError, setMatchesError] = React.useState<string | null>(null);
 
   const fetchMatches = React.useCallback(async (targetRegion: string = "india") => {
     setLoadingJobs(true);
     try {
-      const res = await fetch(`/api/backend/matches?region=${encodeURIComponent(targetRegion)}&limit=15`);
+      const res = await fetch(`/api/backend/matches?region=${encodeURIComponent(targetRegion)}&limit=10`, {
+        cache: "no-store",
+      });
       if (res.ok) {
         const data = await res.json();
+        setAnalysisPending(data.status === "processing" || Boolean(data.analysis_pending));
+        setMatchesError(data.status === "failed" ? data.error || "Match analysis failed." : null);
         const rawMatches = data.matches || [];
         const formatted: Job[] = rawMatches.map((m: any) => ({
           id: m.id,
@@ -88,8 +96,53 @@ function DashboardContent() {
       fetchMatches("india");
     } else {
       setJobs([]);
+      setAnalysisPending(false);
+      setMatchesError(null);
     }
   }, [hasResume, fetchMatches]);
+
+  // While AI analysis is pending, poll the tiny /matches/status endpoint with backoff.
+  // Skips requests while the tab is hidden, stops when done (then refetches matches once) or after 10 min.
+  React.useEffect(() => {
+    if (!hasResume || !analysisPending) return;
+    let cancelled = false;
+    let delay = 3000;
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tick = async () => {
+      if (cancelled || Date.now() - startedAt > 10 * 60 * 1000) return;
+      if (document.visibilityState !== "hidden") {
+        try {
+          const res = await fetch("/api/backend/matches/status", { cache: "no-store" });
+          if (res.ok) {
+            const status = await res.json();
+            if (cancelled) return;
+            setAnalysisLabel(status.step_label || "");
+            const stillWorking = status.status === "processing" || Boolean(status.analysis_pending);
+            if (!stillWorking) {
+              await fetchMatches("india");
+              return;
+            }
+            // A scheduled retry is minutes away: poll slowly. Otherwise back off up to 10s.
+            delay =
+              status.status !== "processing" && status.retry_in
+                ? Math.min(Math.max((status.retry_in * 1000) / 2, 5000), 30000)
+                : Math.min(delay * 1.5, 10000);
+          }
+        } catch {
+          // temporary network blip: keep polling
+        }
+      }
+      if (!cancelled) timer = setTimeout(tick, delay);
+    };
+
+    timer = setTimeout(tick, delay);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [hasResume, analysisPending, fetchMatches]);
 
   // Read selected job ID from URL query parameters (?jobId=...)
   const selectedJobId = searchParams.get("jobId");
@@ -97,11 +150,14 @@ function DashboardContent() {
     return jobs.find((j) => j.id === selectedJobId) || null;
   }, [jobs, selectedJobId]);
 
-  const handleSelectJob = (id: string) => {
-    const params = new URLSearchParams(searchParams.toString());
-    params.set("jobId", id);
-    router.push(`/dashboard?${params.toString()}`);
-  };
+  const handleSelectJob = React.useCallback(
+    (id: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("jobId", id);
+      router.push(`/dashboard?${params.toString()}`);
+    },
+    [router, searchParams]
+  );
 
   const handleCloseModal = () => {
     const params = new URLSearchParams(searchParams.toString());
@@ -218,13 +274,37 @@ function DashboardContent() {
               <span>
                 Showing <strong className="text-zinc-900">{filteredJobs.length}</strong> matched roles
               </span>
+              {analysisPending && filteredJobs.length > 0 && (
+                <span className="inline-flex items-center gap-1.5 text-zinc-500">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  Finishing AI analysis for more roles...
+                </span>
+              )}
             </div>
 
-            {filteredJobs.length === 0 ? (
+            {filteredJobs.length === 0 && analysisPending ? (
+              <div className="rounded-xl border border-zinc-200 bg-white p-8 sm:p-12 text-center space-y-2">
+                <div className="mx-auto h-1.5 w-40 overflow-hidden rounded-full bg-zinc-100">
+                  <div className="h-full w-1/2 rounded-full bg-zinc-400 animate-pulse" />
+                </div>
+                <p className="text-sm font-medium text-zinc-900">AI analysis in progress</p>
+                <p className="text-xs text-zinc-500">
+                  {analysisLabel || "Evaluating your best matches. This page updates automatically."}
+                </p>
+              </div>
+            ) : filteredJobs.length === 0 && matchesError ? (
+              <div className="rounded-xl border border-zinc-200 bg-white p-8 sm:p-12 text-center space-y-3">
+                <p className="text-sm font-medium text-zinc-900">Couldn&apos;t finish the AI analysis</p>
+                <p className="text-xs text-zinc-500">{matchesError}</p>
+                <Button className="w-auto h-8 px-3 text-xs" onClick={() => fetchMatches("india")}>
+                  Try again
+                </Button>
+              </div>
+            ) : filteredJobs.length === 0 ? (
               <div className="rounded-xl border border-zinc-200 bg-white p-8 sm:p-12 text-center">
-                <p className="text-sm font-medium text-zinc-900">No matching roles found</p>
+                <p className="text-sm font-medium text-zinc-900">No matching roles found yet</p>
                 <p className="mt-1 text-xs text-zinc-500">
-                  Try adjusting your search query or region filter.
+                  Upload an updated resume to refresh your matches.
                 </p>
               </div>
             ) : (

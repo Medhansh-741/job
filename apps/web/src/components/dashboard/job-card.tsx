@@ -8,7 +8,7 @@ export interface JobCardProps {
   onSelect: (jobId: string) => void;
 }
 
-export function JobCard({ job, onSelect }: JobCardProps) {
+function JobCardBase({ job, onSelect }: JobCardProps) {
   const handleApplyClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     window.open(job.url, "_blank", "noopener,noreferrer");
@@ -110,3 +110,6 @@ export function JobCard({ job, onSelect }: JobCardProps) {
     </div>
   );
 }
+
+// Memoized: the dashboard re-renders on polling state changes; cards only re-render when their job changes.
+export const JobCard = React.memo(JobCardBase);
