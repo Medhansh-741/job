@@ -17,7 +17,7 @@ import os
 import re
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
@@ -310,16 +310,26 @@ async def execute_matching_funnel(
 
     scored_jobs.sort(key=sort_key, reverse=True)
 
-    # Diversity Invariant: At most 2 postings per company to prevent feed cannibalization
+    # Diversity & Role-Dedup Invariant:
+    # 1. At most 2 postings per company to prevent feed cannibalization.
+    # 2. Strict (company, normalized_title) uniqueness so duplicate aggregator postings are skipped.
     company_counts: Dict[str, int] = {}
+    seen_roles: Set[Tuple[str, str]] = set()
     top_finalists: List[Dict[str, Any]] = []
 
     for job in scored_jobs:
         comp_key = (job.get("normalized_company") or job.get("company") or "unknown").lower().strip()
+        title_key = (job.get("normalized_title") or job.get("title") or "").lower().strip()
+        role_key = (comp_key, title_key)
+
+        if role_key in seen_roles:
+            continue
+
         current_count = company_counts.get(comp_key, 0)
         if current_count >= 2:
             continue
 
+        seen_roles.add(role_key)
         company_counts[comp_key] = current_count + 1
         top_finalists.append(job)
         if len(top_finalists) >= limit:
