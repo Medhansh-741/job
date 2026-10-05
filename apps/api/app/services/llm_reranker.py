@@ -20,23 +20,26 @@ from app.services.jd_parser import parse_job_description
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "openai/gpt-oss-120b"
-GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-120b"
 GROQ_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Global singleton HTTP/2 client with keep-alive
 _groq_client: Optional[httpx.AsyncClient] = None
+_groq_client_key: Optional[str] = None
 
 
 def get_groq_client() -> httpx.AsyncClient:
     """Returns persistent HTTP/2 client with keep-alive to avoid connection overhead."""
-    global _groq_client
-    if _groq_client is None or _groq_client.is_closed:
+    global _groq_client, _groq_client_key
+    current_key = os.getenv("GROQ_API_KEY") or GROQ_API_KEY
+    if _groq_client is None or _groq_client.is_closed or _groq_client_key != current_key:
+        _groq_client_key = current_key
         _groq_client = httpx.AsyncClient(
             http2=True,
-            timeout=20.0,
+            timeout=35.0,
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Authorization": f"Bearer {current_key}",
                 "Content-Type": "application/json",
             }
         )
@@ -305,7 +308,7 @@ async def rerank_finalists_with_llm(
         ],
         "temperature": 0.0,
         "seed": 42,
-        "max_tokens": 8000,
+        "max_tokens": 4096,
         "response_format": {"type": "json_object"},
     }
 
