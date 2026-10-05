@@ -380,7 +380,7 @@ curl -X GET "http://localhost:8000/matches?region=india&limit=15" \
 # Matching Engine Math & Grounding Rubric
 
 ### 1. Stage 1: pgvector Distance & Seniority Knockout
-- Cosine Distance: $D = j.\text{embedding} \Leftrightarrow \text{query\_embedding}$
+- Cosine Distance: `D = j.embedding <=> query_embedding`
 - Raw Cosine Similarity: $S_{\text{raw}} = 1.0 - D$
 - **SQL Hard Knockout Invariant:** If `is_fresher_candidate = true`, any posting with `normalized_title` containing `(senior|sr|lead|architect|manager|staff|principal|director|vp|head of)` is filtered out at the query level.
 

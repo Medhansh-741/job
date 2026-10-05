@@ -16,9 +16,6 @@ function DashboardContent() {
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false);
   const [uploadModalOpen, setUploadModalOpen] = React.useState(false);
-  const [searchQuery, setSearchQuery] = React.useState("");
-  const [regionFilter, setRegionFilter] = React.useState<"all" | "india" | "us" | "remote">("all");
-  const [sortBy, setSortBy] = React.useState<"match" | "newest">("match");
 
   // Active resume state fetched from backend
   const isExplicitEmpty = searchParams.get("empty") === "true";
@@ -29,11 +26,10 @@ function DashboardContent() {
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [loadingJobs, setLoadingJobs] = React.useState<boolean>(false);
 
-  const fetchMatches = React.useCallback(async (targetRegion: string) => {
+  const fetchMatches = React.useCallback(async (targetRegion: string = "india") => {
     setLoadingJobs(true);
     try {
-      const regionParam = targetRegion === "all" ? "all" : targetRegion;
-      const res = await fetch(`/api/backend/matches?region=${encodeURIComponent(regionParam)}&limit=15`);
+      const res = await fetch(`/api/backend/matches?region=${encodeURIComponent(targetRegion)}&limit=15`);
       if (res.ok) {
         const data = await res.json();
         const rawMatches = data.matches || [];
@@ -86,14 +82,14 @@ function DashboardContent() {
       });
   }, [isExplicitEmpty]);
 
-  // Fetch live matches when resume is active or region filter changes
+  // Fetch live matches when resume is active
   React.useEffect(() => {
     if (hasResume) {
-      fetchMatches(regionFilter);
+      fetchMatches("india");
     } else {
       setJobs([]);
     }
-  }, [hasResume, regionFilter, fetchMatches]);
+  }, [hasResume, fetchMatches]);
 
   // Read selected job ID from URL query parameters (?jobId=...)
   const selectedJobId = searchParams.get("jobId");
@@ -114,31 +110,8 @@ function DashboardContent() {
     router.push(query ? `/dashboard?${query}` : "/dashboard");
   };
 
-  // Filter and sort jobs
-  const filteredJobs = React.useMemo(() => {
-    return jobs.filter((job) => {
-      // Region filter: if not 'all', check match (India and US queries already expand to include remote)
-      if (regionFilter !== "all" && job.region !== regionFilter && job.region !== "remote") {
-        return false;
-      }
-      // Search query filter
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        const matchesTitle = job.title.toLowerCase().includes(q);
-        const matchesCompany = job.company.toLowerCase().includes(q);
-        const matchesSkill = job.matchedSkills.some((s) => s.toLowerCase().includes(q));
-        if (!matchesTitle && !matchesCompany && !matchesSkill) {
-          return false;
-        }
-      }
-      return true;
-    }).sort((a, b) => {
-      if (sortBy === "match") {
-        return b.matchScore - a.matchScore;
-      }
-      return 0;
-    });
-  }, [jobs, searchQuery, regionFilter, sortBy]);
+  // Curated matches are already ranked in strict descending order of fit
+  const filteredJobs = jobs;
 
   return (
     <div className="flex min-h-dvh bg-zinc-50">
@@ -154,15 +127,14 @@ function DashboardContent() {
       {/* Main Content Area: 100% width on mobile */}
       <main className="flex-1 flex flex-col min-w-0 w-full">
         {/* Top Control Bar */}
-        <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/95 backdrop-blur-xs px-3.5 sm:px-6 py-3 space-y-2.5">
-          {/* Row 1: Hamburger Menu (Mobile), Search Input */}
-          <div className="flex items-center gap-2.5 w-full">
-            {/* Mobile Hamburger Toggle */}
+        {/* Mobile Header Toggle */}
+        <header className="md:hidden sticky top-0 z-10 border-b border-zinc-200 bg-white/95 backdrop-blur-xs px-3.5 py-2.5 flex items-center justify-between">
+          <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => setMobileSidebarOpen(true)}
               aria-label="Open menu"
-              className="md:hidden flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
             >
               <svg
                 className="h-4 w-4"
@@ -178,63 +150,7 @@ function DashboardContent() {
                 <line x1="3" y1="18" x2="21" y2="18" />
               </svg>
             </button>
-
-            {/* Search Input (Takes all remaining width) */}
-            <div className="relative flex-1 min-w-0">
-              <svg
-                className="absolute left-3 top-2.5 h-4 w-4 text-zinc-400"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
-              </svg>
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search by role, company, or skill..."
-                disabled={!hasResume}
-                className="w-full rounded-md border border-zinc-200 bg-zinc-50 pl-9 pr-3 py-1.5 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-900 focus:bg-white focus:outline-none focus:ring-1 focus:ring-zinc-900 transition-colors disabled:opacity-50"
-              />
-            </div>
-          </div>
-
-          {/* Row 2: Region Filters (Horizontal scroll on mobile) & Sort */}
-          <div className="flex items-center justify-between gap-2 w-full">
-            {/* Scrollable Region Filter Chips */}
-            <div className="flex items-center overflow-x-auto rounded-lg border border-zinc-200 bg-zinc-50 p-0.5 text-xs shrink-0 max-w-[calc(100%-110px)] sm:max-w-none">
-              {(["all", "india", "us", "remote"] as const).map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  disabled={!hasResume}
-                  onClick={() => setRegionFilter(r)}
-                  className={`rounded-md px-2 sm:px-2.5 py-1 text-[11px] sm:text-xs capitalize transition-colors shrink-0 disabled:opacity-40 ${
-                    regionFilter === r
-                      ? "bg-white font-medium text-zinc-900 shadow-2xs"
-                      : "text-zinc-500 hover:text-zinc-900"
-                  }`}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
-
-            {/* Sort Dropdown */}
-            <select
-              value={sortBy}
-              disabled={!hasResume}
-              onChange={(e) => setSortBy(e.target.value as "match" | "newest")}
-              className="rounded-lg border border-zinc-200 bg-white px-2 py-1 text-[11px] sm:text-xs text-zinc-800 focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 cursor-pointer shrink-0 disabled:opacity-40"
-            >
-              <option value="match">Highest %</option>
-              <option value="newest">Newest</option>
-            </select>
+            <span className="text-sm font-semibold text-zinc-900">Job Matcher</span>
           </div>
         </header>
 
@@ -332,7 +248,7 @@ function DashboardContent() {
         onUploadSuccess={() => {
           setHasResume(true);
           setLoadingResume(false);
-          fetchMatches(regionFilter);
+          fetchMatches("india");
         }}
       />
     </div>

@@ -182,14 +182,15 @@ def build_rerank_prompt(candidate: Dict[str, Any], compressed_jobs: List[Dict[st
         "present in their verified_skills or projects. If a job requires a skill the candidate lacks, you MUST list it in 'gaps'.\n"
         "3. DIRECT HUMAN TONE: Write concise, direct language addressing the candidate in the second person "
         "('Your RailMind project demonstrates...', 'However, you lack Angular...').\n"
-        "4. Output valid, parseable JSON conforming strictly to the requested schema."
+        "4. CONCISE VERDICT MANDATE: Keep each 'verdict' strictly to 1-2 punchy sentences (maximum 25 words).\n"
+        "5. Output valid, parseable JSON conforming strictly to the requested schema."
     )
 
     user_payload = {
         "candidate_profile": candidate,
         "candidate_jobs": compressed_jobs,
         "evaluation_rubric": {
-            "verdict": "Mandatory 2-sentence plain-English summary. Sentence 1 MUST cite at least one specific candidate project or experience name from the profile proving capability to fulfill core JD responsibilities. Sentence 2 MUST state the specific required JD tools that are missing from candidate's resume (or confirm a complete stack match).",
+            "verdict": "Strictly 1-2 punchy sentences (maximum 25 words). Sentence 1 cites a candidate project/experience name proving fit. Sentence 2 states missing tools or confirms complete stack match.",
             "strengths": "Array of strings: Candidate skills verified to match JD requirements.",
             "gaps": "Array of strings: Core JD requirements candidate explicitly lacks.",
             "deductions": "Array of objects {skill: string, points: integer, reason: string} for specific missing technical tools (2-5 points each).",
@@ -295,54 +296,62 @@ async def rerank_finalists_with_llm(
         return _apply_math_fallback(finalists, "Groq API key not configured; using deterministic math scores.")
 
     candidate = extract_candidate_snapshot(candidate_profile)
-    compressed_jobs = [compress_job_card(j) for j in finalists]
-    system_prompt, user_prompt = build_rerank_prompt(candidate, compressed_jobs)
 
-    client = get_groq_client()
-    request_body = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.0,
-        "seed": 42,
-        "max_tokens": 4096,
-        "response_format": {"type": "json_object"},
-    }
+    async def _evaluate_chunk(chunk_jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        compressed_chunk = [compress_job_card(j) for j in chunk_jobs]
+        system_prompt, user_prompt = build_rerank_prompt(candidate, compressed_chunk)
 
-    # Attempt API call with 1 exponential backoff retry on 429/timeout
-    response_json = None
-    for attempt in range(2):
-        if attempt == 1:
-            request_body["model"] = GROQ_FALLBACK_MODEL
-        try:
-            response = await client.post(GROQ_COMPLETIONS_URL, json=request_body)
-            if response.status_code == 200:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                response_json = json.loads(content)
+        request_body = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "seed": 42,
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"},
+        }
+
+        client = get_groq_client()
+        for attempt in range(2):
+            if attempt == 1:
+                request_body["model"] = GROQ_FALLBACK_MODEL
+            try:
+                response = await client.post(GROQ_COMPLETIONS_URL, json=request_body)
+                if response.status_code == 200:
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    parsed = json.loads(content)
+                    return {
+                        item.get("job_id"): item
+                        for item in parsed.get("evaluations", [])
+                        if isinstance(item, dict) and "job_id" in item
+                    }
+                elif response.status_code in (429, 503) and attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                else:
+                    break
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
                 break
-            elif response.status_code in (429, 503) and attempt == 0:
-                await asyncio.sleep(1.5)
-                continue
-            else:
-                break
-        except Exception:
-            if attempt == 0:
-                await asyncio.sleep(1.5)
-                continue
-            break
+        return {}
 
-    if not response_json or "evaluations" not in response_json:
+    # Parallel micro-batching: split into chunks of <= 8 to guarantee zero token truncation
+    if len(finalists) > 8:
+        mid = (len(finalists) + 1) // 2
+        chunk1 = finalists[:mid]
+        chunk2 = finalists[mid:]
+        results = await asyncio.gather(_evaluate_chunk(chunk1), _evaluate_chunk(chunk2))
+        evaluations_by_id = {**results[0], **results[1]}
+    else:
+        evaluations_by_id = await _evaluate_chunk(finalists)
+
+    if not evaluations_by_id:
         return _apply_math_fallback(finalists, "LLM re-ranking temporarily unavailable; calibrated with deterministic math.")
-
-    # Map evaluations by job_id
-    evaluations_by_id = {
-        item.get("job_id"): item
-        for item in response_json["evaluations"]
-        if isinstance(item, dict) and "job_id" in item
-    }
 
     calibrated_jobs = []
     for job in finalists:
@@ -402,6 +411,7 @@ def _apply_math_fallback(finalists: List[Dict[str, Any]], message: str) -> List[
     for job in finalists:
         fallback_jobs.append({
             **job,
+            "llm_score": job["match_score"],
             "explanation": f"{message} (Score: {job['match_score']}%)",
             "score_breakdown": {
                 "math_score": job["match_score"],
