@@ -14,6 +14,10 @@ export function JobCard({ job, onSelect }: JobCardProps) {
     window.open(job.url, "_blank", "noopener,noreferrer");
   };
 
+  // Two-tier badge logic: Exact Match >= 75% AND >= 3 explicit matched skills
+  const isExactMatch = job.matchScore >= 75 && job.matchedSkills.length >= 3;
+  const inferredCount = job.inferredSkills ? job.inferredSkills.length : 0;
+
   return (
     <div
       onClick={() => onSelect(job.id)}
@@ -39,11 +43,19 @@ export function JobCard({ job, onSelect }: JobCardProps) {
           </h3>
         </div>
 
-        {/* Match Score Badge */}
+        {/* Two-Tier Match Score Badge */}
         <div className="shrink-0 flex items-center justify-between sm:justify-end gap-2">
-          <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 sm:px-2.5 py-0.5 text-[11px] sm:text-xs font-medium text-emerald-800">
-            {job.matchScore}% Match
-          </span>
+          {isExactMatch ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 sm:px-2.5 py-0.5 text-[11px] sm:text-xs font-semibold text-emerald-800 shadow-2xs">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              <span>Exact Match · {job.matchScore}%</span>
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-100 px-2 sm:px-2.5 py-0.5 text-[11px] sm:text-xs font-semibold text-zinc-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-zinc-400" />
+              <span>Broader Fit · {job.matchScore}%</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -62,6 +74,11 @@ export function JobCard({ job, onSelect }: JobCardProps) {
           {job.matchedSkills.length > 4 && (
             <span className="text-[10px] sm:text-[11px] text-zinc-400 font-medium">
               +{job.matchedSkills.length - 4}
+            </span>
+          )}
+          {inferredCount > 0 && (
+            <span className="rounded border border-blue-200 bg-blue-50 px-1.5 sm:px-2 py-0.5 text-[10px] sm:text-[11px] font-medium text-blue-700">
+              +{inferredCount} inferred
             </span>
           )}
         </div>

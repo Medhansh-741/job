@@ -7,7 +7,7 @@ import { JobCard } from "@/components/dashboard/job-card";
 import { JobModal } from "@/components/dashboard/job-modal";
 import { UploadModal } from "@/components/dashboard/upload-modal";
 import { Button } from "@/components/ui/button";
-import { MOCK_JOBS } from "@/lib/mock-jobs";
+import { Job } from "@/types/job";
 
 function DashboardContent() {
   const router = useRouter();
@@ -24,6 +24,44 @@ function DashboardContent() {
   const isExplicitEmpty = searchParams.get("empty") === "true";
   const [hasResume, setHasResume] = React.useState<boolean>(!isExplicitEmpty);
   const [loadingResume, setLoadingResume] = React.useState<boolean>(true);
+
+  // Live jobs state from backend matching engine
+  const [jobs, setJobs] = React.useState<Job[]>([]);
+  const [loadingJobs, setLoadingJobs] = React.useState<boolean>(false);
+
+  const fetchMatches = React.useCallback(async (targetRegion: string) => {
+    setLoadingJobs(true);
+    try {
+      const regionParam = targetRegion === "all" ? "all" : targetRegion;
+      const res = await fetch(`/api/backend/matches?region=${encodeURIComponent(regionParam)}&limit=15`);
+      if (res.ok) {
+        const data = await res.json();
+        const rawMatches = data.matches || [];
+        const formatted: Job[] = rawMatches.map((m: any) => ({
+          id: m.id,
+          title: m.title,
+          company: m.company,
+          location: m.location || "Remote",
+          region: (m.region as "india" | "us" | "remote") || "india",
+          matchScore: m.match_score,
+          matchedSkills: m.matched_skills || [],
+          inferredSkills: m.inferred_skills || m.score_breakdown?.inferred_skills || [],
+          missingSkills: m.missing_skills || [],
+          explanation: m.explanation || "",
+          scoreBreakdown: m.score_breakdown || {},
+          description: m.description || "",
+          url: m.source_url || "#",
+          postedAt: m.date_posted ? new Date(m.date_posted).toLocaleDateString() : undefined,
+          ats: m.id.includes(":") ? m.id.split(":")[0] : undefined,
+        }));
+        setJobs(formatted);
+      }
+    } catch (err) {
+      console.error("Failed to load matches:", err);
+    } finally {
+      setLoadingJobs(false);
+    }
+  }, []);
 
   React.useEffect(() => {
     if (isExplicitEmpty) {
@@ -48,11 +86,20 @@ function DashboardContent() {
       });
   }, [isExplicitEmpty]);
 
+  // Fetch live matches when resume is active or region filter changes
+  React.useEffect(() => {
+    if (hasResume) {
+      fetchMatches(regionFilter);
+    } else {
+      setJobs([]);
+    }
+  }, [hasResume, regionFilter, fetchMatches]);
+
   // Read selected job ID from URL query parameters (?jobId=...)
   const selectedJobId = searchParams.get("jobId");
   const selectedJob = React.useMemo(() => {
-    return MOCK_JOBS.find((j) => j.id === selectedJobId) || null;
-  }, [selectedJobId]);
+    return jobs.find((j) => j.id === selectedJobId) || null;
+  }, [jobs, selectedJobId]);
 
   const handleSelectJob = (id: string) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -69,9 +116,9 @@ function DashboardContent() {
 
   // Filter and sort jobs
   const filteredJobs = React.useMemo(() => {
-    return MOCK_JOBS.filter((job) => {
-      // Region filter
-      if (regionFilter !== "all" && job.region !== regionFilter) {
+    return jobs.filter((job) => {
+      // Region filter: if not 'all', check match (India and US queries already expand to include remote)
+      if (regionFilter !== "all" && job.region !== regionFilter && job.region !== "remote") {
         return false;
       }
       // Search query filter
@@ -91,7 +138,7 @@ function DashboardContent() {
       }
       return 0;
     });
-  }, [searchQuery, regionFilter, sortBy]);
+  }, [jobs, searchQuery, regionFilter, sortBy]);
 
   return (
     <div className="flex min-h-dvh bg-zinc-50">
@@ -192,7 +239,7 @@ function DashboardContent() {
         </header>
 
         {/* Content Body: Skeletons vs Clean Empty State vs Active Feed */}
-        {loadingResume ? (
+        {loadingResume || (hasResume && loadingJobs && jobs.length === 0) ? (
           <div className="flex-1 p-3.5 sm:p-5 md:p-6 max-w-5xl w-full mx-auto space-y-3">
             <div className="h-3 w-36 rounded bg-zinc-200/70 animate-pulse" />
             <div className="space-y-2.5">
@@ -285,6 +332,7 @@ function DashboardContent() {
         onUploadSuccess={() => {
           setHasResume(true);
           setLoadingResume(false);
+          fetchMatches(regionFilter);
         }}
       />
     </div>

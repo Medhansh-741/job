@@ -23,6 +23,31 @@ export function JobModal({ job, onClose }: JobModalProps) {
 
   if (!job) return null;
 
+  const isExactMatch = job.matchScore >= 75 && job.matchedSkills.length >= 3;
+  const breakdown = job.scoreBreakdown || {};
+  const deductions = breakdown.deductions || [];
+
+  const explanation =
+    breakdown.verdict ||
+    job.explanation ||
+    "Strong technical alignment across core requirements.";
+
+  const strengths = job.matchedSkills.length > 0 ? job.matchedSkills : (breakdown.strengths || []);
+  const gaps = (job.missingSkills && job.missingSkills.length > 0) ? job.missingSkills : (breakdown.gaps || []);
+
+  // Clean description of awkward leading/trailing aggregator snippet artifacts
+  const rawDescription = job.description || "";
+  const cleanedDescription = rawDescription
+    .replace(/^[\s\.\…\-–—]+/, "") // strip leading ... or hyphens
+    .replace(/[\s\.\…]+$/, "")   // strip trailing ...
+    .trim();
+
+  const isAggregatorSnippet =
+    rawDescription.includes("...") ||
+    rawDescription.length < 350 ||
+    job.id.startsWith("jooble:") ||
+    job.id.startsWith("adzuna:");
+
   return (
     <div
       role="dialog"
@@ -32,7 +57,7 @@ export function JobModal({ job, onClose }: JobModalProps) {
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-xl max-h-[90dvh] flex flex-col rounded-xl border border-zinc-200 bg-white shadow-xl overflow-hidden"
+        className="w-full max-w-2xl max-h-[90dvh] flex flex-col rounded-xl border border-zinc-200 bg-white shadow-xl overflow-hidden"
       >
         {/* Modal Header */}
         <div className="flex items-start justify-between p-4 sm:p-6 border-b border-zinc-100">
@@ -48,9 +73,17 @@ export function JobModal({ job, onClose }: JobModalProps) {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 sm:px-2.5 py-0.5 text-[11px] sm:text-xs font-medium text-emerald-800">
-              {job.matchScore}% Match
-            </span>
+            {isExactMatch ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[11px] sm:text-xs font-semibold text-emerald-800">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <span>Exact Match · {job.matchScore}%</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-0.5 text-[11px] sm:text-xs font-semibold text-zinc-700">
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-400" />
+                <span>Broader Fit · {job.matchScore}%</span>
+              </span>
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -73,54 +106,67 @@ export function JobModal({ job, onClose }: JobModalProps) {
         </div>
 
         {/* Modal Scrollable Body */}
-        <div className="p-4 sm:p-6 overflow-y-auto space-y-4 sm:space-y-5">
-          {/* Why It Matches Section (Lazy LLM explanation container) */}
-          <div className="rounded-lg border border-zinc-200 bg-zinc-50/70 p-3.5 sm:p-4 space-y-1.5">
+        <div className="p-4 sm:p-6 overflow-y-auto space-y-5">
+          {/* Grounded AI Match Analysis Card */}
+          <div className="rounded-xl border border-zinc-200/90 bg-zinc-50/80 p-4 space-y-2">
             <div className="flex items-center justify-between">
-              <h3 className="text-[11px] sm:text-xs font-semibold uppercase tracking-wider text-zinc-700">
-                Why It Matches Your Profile
-              </h3>
-              <span className="text-[10px] text-zinc-400 font-mono">
-                AI Evaluation
+              <div className="flex items-center gap-1.5">
+                <svg className="h-3.5 w-3.5 text-zinc-700" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                </svg>
+                <h3 className="text-xs font-semibold tracking-wide uppercase text-zinc-800">
+                  AI Match Analysis
+                </h3>
+              </div>
+              <span className="text-[10px] text-zinc-400 font-mono tracking-tight">
+                Calibrated by LPU
               </span>
             </div>
-            <p className="text-xs text-zinc-600 leading-relaxed">
-              Strong alignment across core requirements. Your experience with{" "}
-              <strong className="text-zinc-900 font-medium">
-                {job.matchedSkills.slice(0, 3).join(", ")}
-              </strong>{" "}
-              directly satisfies this position&apos;s technical qualifications.
+            <p className="text-xs sm:text-[13px] text-zinc-800 leading-relaxed font-normal">
+              {explanation}
             </p>
           </div>
 
-          {/* Skills Breakdown */}
-          <div className="space-y-2.5">
+          {/* Strengths & Gaps (Green Strengths, Greyed Gaps) */}
+          <div className="space-y-4">
+            {/* Strengths (Green) */}
             <div>
-              <h4 className="text-xs font-medium text-zinc-700 mb-1.5">
-                Matched Skills ({job.matchedSkills.length})
-              </h4>
+              <div className="flex items-center gap-1.5 mb-2">
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                <h4 className="text-xs font-semibold text-zinc-900">
+                  Strengths & Verified Matches ({strengths.length})
+                </h4>
+              </div>
               <div className="flex flex-wrap gap-1.5">
-                {job.matchedSkills.map((skill) => (
-                  <span
-                    key={skill}
-                    className="rounded bg-emerald-50 border border-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800"
-                  >
-                    {skill}
-                  </span>
-                ))}
+                {strengths.length > 0 ? (
+                  strengths.map((skill) => (
+                    <span
+                      key={skill}
+                      className="rounded-md bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 text-xs font-medium text-emerald-800"
+                    >
+                      {skill}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-xs text-zinc-400 italic">No direct explicit skill overlap</span>
+                )}
               </div>
             </div>
 
-            {job.missingSkills && job.missingSkills.length > 0 && (
+            {/* Gaps (Greyed out) */}
+            {gaps.length > 0 && (
               <div>
-                <h4 className="text-xs font-medium text-zinc-500 mb-1.5">
-                  Skills to Learn / Mention ({job.missingSkills.length})
-                </h4>
+                <div className="flex items-center gap-1.5 mb-2">
+                  <span className="h-2 w-2 rounded-full bg-zinc-400" />
+                  <h4 className="text-xs font-semibold text-zinc-700">
+                    Gaps & Missing Requirements ({gaps.length})
+                  </h4>
+                </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {job.missingSkills.map((skill) => (
+                  {gaps.map((skill) => (
                     <span
                       key={skill}
-                      className="rounded bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-600"
+                      className="rounded-md bg-zinc-100 border border-zinc-200/80 border-dashed px-2.5 py-0.5 text-xs font-medium text-zinc-500"
                     >
                       {skill}
                     </span>
@@ -130,17 +176,66 @@ export function JobModal({ job, onClose }: JobModalProps) {
             )}
           </div>
 
-          {/* Job Description Preview */}
-          <div className="space-y-1.5 pt-2 border-t border-zinc-100">
-            <h4 className="text-xs font-medium text-zinc-700">Role Overview</h4>
-            <p className="text-xs text-zinc-600 leading-relaxed whitespace-pre-line">
-              {job.description}
-            </p>
+          {/* Itemized Deductions (if any) */}
+          {deductions.length > 0 && (
+            <div className="rounded-xl border border-zinc-200 bg-white p-3.5 space-y-2">
+              <div className="flex items-center gap-1.5 text-zinc-800">
+                <svg className="h-3.5 w-3.5 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-700">
+                  Calibrated Deductions
+                </h4>
+              </div>
+              <ul className="space-y-1.5 pl-5 list-disc text-xs text-zinc-600">
+                {deductions.map((d, idx) => (
+                  <li key={idx} className="leading-snug">
+                    <span className="font-semibold text-zinc-900">-{d.points} pts:</span> {d.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Job Description Overview */}
+          <div className="space-y-2 pt-3 border-t border-zinc-100">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-semibold text-zinc-900">Job Overview</h4>
+              {isAggregatorSnippet && (
+                <span className="text-[10px] text-zinc-400 font-mono tracking-tight">
+                  Aggregator preview snippet
+                </span>
+              )}
+            </div>
+            <div className="rounded-lg bg-zinc-50 p-3.5 text-xs text-zinc-600 leading-relaxed whitespace-pre-line max-h-60 overflow-y-auto border border-zinc-200/50 space-y-2.5">
+              <p>
+                {cleanedDescription}
+                {isAggregatorSnippet ? "..." : ""}
+              </p>
+              {isAggregatorSnippet && (
+                <p className="text-[11px] text-zinc-500 font-medium pt-2 border-t border-zinc-200/60">
+                  <a
+                    href={job.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1 font-semibold"
+                  >
+                    Click &apos;Apply on Company Site&apos; to view the full job description
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                    </svg>
+                  </a>
+                </p>
+              )}
+            </div>
           </div>
         </div>
 
         {/* Modal Footer Actions */}
-        <div className="flex items-center justify-end gap-2.5 p-3 sm:p-4 border-t border-zinc-100 bg-zinc-50">
+        <div className="flex items-center justify-end gap-2.5 p-3.5 sm:p-4 border-t border-zinc-100 bg-zinc-50">
           <Button variant="outline" className="w-auto h-8 sm:h-9 text-xs" onClick={onClose}>
             Close
           </Button>
