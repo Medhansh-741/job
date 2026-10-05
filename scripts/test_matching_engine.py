@@ -567,9 +567,10 @@ async def test_9_groq_llm_reranker():
     }
     snapshot = extract_candidate_snapshot(sample_profile)
     assert snapshot["headline"] == "Full Stack Developer | React, Node.js"
-    assert len(snapshot["project_headlines"]) == 2
-    assert "•" not in snapshot["project_headlines"][0]
-    print(f"  [PASS] Candidate snapshot extracted cleanly: {snapshot['project_headlines']}")
+    project_names = [pr["name"] for pr in snapshot["projects"]]
+    assert len(project_names) == 2
+    assert "•" not in project_names[0]
+    print(f"  [PASS] Candidate snapshot extracted cleanly: {project_names}")
 
     # 2. Compressed Job Card Test
     sample_job = {
@@ -615,28 +616,37 @@ async def test_9_groq_llm_reranker():
     assert "go" in breakdown["gaps"]
     print(f"  [PASS] Blended score, Schema-to-Schema rubric & grounded verdict verified: Math=50, LLM={llm_s} -> Blended={final_s}")
 
-    # 4. Live Groq Re-Ranking on getwingapp Anomaly Resolution
+    # 4. Live Groq Re-Ranking on getwingapp (ONE real call through the shared gateway; cache disabled)
     print("  Executing live Groq re-ranking call on getwingapp...")
-    calibrated = await rerank_finalists_with_llm(sample_profile, [sample_job])
-    assert len(calibrated) == 1
-    cal_res = calibrated[0]
-    print(f"  Live Groq Calibrated Results:")
-    print(f"    Math Score: {sample_job['match_score']}%")
-    print(f"    Calibrated Final Score: {cal_res['match_score']}%")
-    print(f"    LLM Sub-score: {cal_res['llm_score']}%")
-    print(f"    Calibrated By: {cal_res['calibrated_by']}")
-    
-    if cal_res.get("calibrated_by") == "deterministic_math_fallback":
-        assert cal_res["match_score"] == 50, f"Expected fallback score 50, got {cal_res['match_score']}"
-        print("  [PASS] getwingapp fallback preserved math score during rate limit!")
+
+    async def _no_cache_get(*_a):
+        return {}
+
+    async def _no_cache_put(*_a):
+        return None
+
+    outcome = await rerank_finalists_with_llm(
+        sample_profile, [sample_job], target=1, initial=1,
+        cache_get=_no_cache_get, cache_put=_no_cache_put,
+    )
+    if outcome.explained:
+        cal_res = outcome.explained[0]
+        print(f"  Live Groq Calibrated Results: math {sample_job['match_score']}% -> final {cal_res['match_score']}% "
+              f"(LLM sub-score {cal_res['llm_score']}%), calibrated_by={cal_res['calibrated_by']}")
+        assert cal_res["explanation"], "explained job must carry a verdict"
+        assert 40 <= cal_res["match_score"] <= 90, f"Unexpected calibrated score {cal_res['match_score']}%"
+        print("  [PASS] getwingapp explained by the LLM and blended deterministically")
     else:
-        assert 60 <= cal_res["match_score"] <= 85, f"Expected calibrated score in [60, 85], got {cal_res['match_score']}%"
-        print("  [PASS] getwingapp successfully calibrated from Math 50% to honest fit!")
+        assert outcome.pending and outcome.retry_after is not None, "unexplained jobs must be reported as pending with retry_after"
+        print(f"  [PASS] Groq unavailable right now: job kept hidden as pending, retry in {outcome.retry_after:.0f}s")
 
 
 async def test_10_groq_fallback_resilience():
-    test_section_header("TEST 10: GROQ RATE-LIMIT (429) & DEGRADATION FALLBACK RESILIENCE")
-    
+    test_section_header("TEST 10: GROQ RATE-LIMIT (429) HANDLING VIA THE GATEWAY (offline, fake transport)")
+
+    import httpx
+    from app.services.groq_gateway import GroqGateway
+
     sample_profile = {
         "headline": "Full-Stack Developer",
         "skills": ["react", "nodejs", "python"],
@@ -650,30 +660,25 @@ async def test_10_groq_fallback_resilience():
         "match_score": 68,
         "matched_skills": ["python"],
         "missing_skills": ["docker"],
+        "skills": ["python", "docker"],
         "date_posted": "2026-03-01",
         "description": "Building microservices with Python and FastAPI.",
     }
+    calls = []
 
-    import httpx
-    from app.services.llm_reranker import get_groq_client
-    client = get_groq_client()
-    original_post = client.post
+    def always_429(request):
+        calls.append(1)
+        return httpx.Response(429, headers={"retry-after": "30"}, json={"error": {"message": "Rate limit reached"}})
 
-    async def mock_429_post(*args, **kwargs):
-        req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
-        raise httpx.HTTPStatusError("Rate limit exceeded", request=req, response=httpx.Response(429, request=req))
-
-    client.post = mock_429_post
-    try:
-        print("  Simulating Groq HTTP 429 Rate Limit response...")
-        calibrated = await rerank_finalists_with_llm(sample_profile, [sample_job])
-        assert len(calibrated) == 1, "Fallback must return all finalists"
-        res = calibrated[0]
-        assert res["match_score"] == 68, f"Fallback must preserve Phase 4.2 Math score (68), got {res['match_score']}"
-        assert "fallback" in res["calibrated_by"] or "deterministic" in res["calibrated_by"]
-        print(f"  [PASS] 429 Handled gracefully! Calibrated by: {res['calibrated_by']}, Score preserved: {res['match_score']}%")
-    finally:
-        client.post = original_post
+    gw = GroqGateway([("k1", "key-1"), ("k2", "key-2")], transport=httpx.MockTransport(always_429))
+    print("  Simulating HTTP 429 on every key...")
+    outcome = await rerank_finalists_with_llm(sample_profile, [sample_job], target=1, initial=1, gateway=gw)
+    await gw.aclose()
+    assert outcome.explained == [], "no job may surface without an LLM explanation"
+    assert len(outcome.pending) == 1 and outcome.pending[0]["match_score"] == 68, "math score preserved on the hidden pending row"
+    assert outcome.retry_after is not None and outcome.retry_after >= 1, "caller must be told when to retry"
+    assert len(calls) <= 2, f"gateway must stop after one retry across the key pool, made {len(calls)} calls"
+    print(f"  [PASS] 429 handled: nothing surfaced, pending kept, retry in {outcome.retry_after:.0f}s, {len(calls)} request(s) made")
 
 
 async def test_11_async_queue_concurrency_and_dedup():

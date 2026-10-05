@@ -26,6 +26,7 @@ from app.services.catalog_normalizer import (
     is_senior_role,
     extract_required_years,
     extract_skills,
+    clean_html_text,
     strip_html_and_truncate,
     parse_date_posted,
 )
@@ -173,7 +174,9 @@ async def crawl_all_boards() -> List[Dict[str, Any]]:
             continue
         seen_ids.add(job_id)
 
-        desc = strip_html_and_truncate(j["description"], 1500)
+        # Extract skills/years from the FULL cleaned text; only the stored description is truncated.
+        full_text = clean_html_text(j["description"])
+        desc = full_text[:1500]
         candidates.append({
             "id": job_id,
             "title": title,
@@ -186,8 +189,8 @@ async def crawl_all_boards() -> List[Dict[str, Any]]:
             "description": desc,
             "source_url": j["url"],
             "date_posted": parse_date_posted(j.get("date_posted")),
-            "required_years": extract_required_years(desc),
-            "skills": extract_skills(title + " " + desc),
+            "required_years": extract_required_years(full_text),
+            "skills": extract_skills(title + " " + full_text),
         })
 
     print(f"Filtered to {len(candidates)} valid IC engineering jobs.")

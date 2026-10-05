@@ -1,134 +1,152 @@
-import os
-import re
-import json
+"""One-time batched Groq backfill for jobs that STILL have no skills after deterministic extraction.
+
+Run it yourself when your Groq limits are fresh. Every call goes through the shared gateway
+(key pool + RPM/TPM limiter + cooldowns), batches ~15 jobs per call, and writes each batch to the DB
+as soon as it returns, so the script is safe to stop and re-run (it only selects still-blank jobs).
+LLM output is mapped onto the shared skills taxonomy; unknown tokens are dropped so job and
+candidate skills stay in one vocabulary.
+
+DRY-RUN by default (prints job count and estimated Groq calls/tokens, makes NO Groq call).
+Pass --apply to call Groq and write results.
+
+Usage:
+    python scripts/backfill_job_skills_llm.py                 # dry-run estimate
+    python scripts/backfill_job_skills_llm.py --apply         # run it
+    python scripts/backfill_job_skills_llm.py --apply --limit 150 --batch-size 12
+"""
+import argparse
 import asyncio
-import httpx
+import json
+import os
+import sys
+from pathlib import Path
+
 import psycopg2
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / "apps" / "api" / ".env")
+sys.path.insert(0, str(ROOT / "apps" / "api"))
+
+from app.services.catalog_normalizer import canonicalize_skill
+from app.services.groq_gateway import (
+    GroqError,
+    LLMBadResponse,
+    LLMTruncated,
+    LLMUnavailable,
+    close_gateway,
+    estimate_tokens,
+    get_gateway,
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL = "openai/gpt-oss-20b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+DESCRIPTION_CHARS = 900
 
-SEMAPHORE = asyncio.Semaphore(12)
-
-PROMPT_TEMPLATE = """Extract all technical skills, programming languages, libraries, frameworks, cloud tools, databases, and engineering methodologies mentioned or implied in this job description.
-Return ONLY a valid JSON object matching this schema:
-{{"skills": ["skill1", "skill2"]}}
-All skills must be lowercase canonical names (e.g., 'python', 'react', 'fastapi', 'postgresql', 'docker', 'rest', 'oop', 'sql', 'git', 'c++', 'testing', 'linux').
-If no technical skills are mentioned, return {{"skills": []}}.
-
-Job Title: {title}
-Company: {company}
-Description:
-{description}"""
+SYSTEM_PROMPT = (
+    "Extract the technical skills (languages, frameworks, libraries, databases, cloud/devops tools, ML/AI "
+    "techniques, engineering practices) required or clearly implied by each job. Use short lowercase "
+    "canonical names such as 'python', 'react', 'postgresql', 'docker', 'rest', 'machine learning'. "
+    "Use [] when a job names no technical skills.\n"
+    'Return JSON only: {"results":[{"k":"1","skills":["python"]}]} with one entry per job, `k` copied from the job.'
+)
 
 
-async def extract_skills_for_job(client: httpx.AsyncClient, job: dict) -> tuple:
-    job_id = job["id"]
-    title = job["title"] or ""
-    company = job["company"] or ""
-    desc = (job["description"] or "")[:1200]
-
-    prompt = PROMPT_TEMPLATE.format(title=title, company=company, description=desc)
-
-    for attempt in range(3):
-        async with SEMAPHORE:
-            try:
-                resp = await client.post(
-                    GROQ_URL,
-                    json={
-                        "model": MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "response_format": {"type": "json_object"},
-                    },
-                    timeout=15.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
-                    skills = parsed.get("skills", [])
-                    # Clean and deduplicate skills
-                    cleaned = sorted(list(set(
-                        s.lower().strip() for s in skills 
-                        if isinstance(s, str) and 1 <= len(s.strip()) <= 35
-                    )))
-                    return job_id, cleaned
-                elif resp.status_code == 429:
-                    await asyncio.sleep(2.0 * (attempt + 1))
-                else:
-                    await asyncio.sleep(1.0)
-            except Exception as e:
-                await asyncio.sleep(1.0)
-
-    return job_id, []
+def build_messages(batch):
+    jobs = [
+        {"k": str(i), "title": j["title"] or "", "description": (j["description"] or "")[:DESCRIPTION_CHARS]}
+        for i, j in enumerate(batch, start=1)
+    ]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps({"jobs": jobs}, separators=(",", ":"), ensure_ascii=False)},
+    ]
 
 
-async def main():
+def parse_results(data, batch):
+    key_to_id = {str(i): j["id"] for i, j in enumerate(batch, start=1)}
+    out = {}
+    for item in data.get("results") or []:
+        job_id = key_to_id.get(str(item.get("k", "")).strip())
+        if not job_id or not isinstance(item.get("skills"), list):
+            continue
+        canon = {canonicalize_skill(s) for s in item["skills"] if isinstance(s, str)}
+        canon.discard(None)
+        out[job_id] = sorted(canon)
+    return out
+
+
+async def run(args) -> None:
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
     cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, title, company, description
-        FROM public.jobs
+    cur.execute(
+        """
+        SELECT id, title, description FROM public.jobs
         WHERE is_active = true
           AND region IN ('india', 'remote')
           AND (skills IS NULL OR cardinality(skills) = 0)
-        ORDER BY created_at DESC;
-    """)
-    rows = cur.fetchall()
-    jobs = [{"id": r[0], "title": r[1], "company": r[2], "description": r[3]} for r in rows]
-    total = len(jobs)
-    print(f"Found {total} India/Remote jobs with empty skills to enrich.")
+        ORDER BY region, id;
+        """
+    )
+    jobs = [{"id": r[0], "title": r[1], "description": r[2]} for r in cur.fetchall()]
+    if args.limit:
+        jobs = jobs[: args.limit]
+    batches = [jobs[i:i + args.batch_size] for i in range(0, len(jobs), args.batch_size)]
+    sample_tokens = estimate_tokens(build_messages(jobs[: args.batch_size])) if jobs else 0
+    print(f"{len(jobs)} blank-skill jobs -> {len(batches)} Groq calls (~{sample_tokens} input tokens each).")
 
-    if total == 0:
+    if not args.apply:
+        print("DRY-RUN: no Groq call made. Re-run with --apply.")
         conn.close()
         return
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    gw = get_gateway()
+    if not gw.has_keys:
+        print("No Groq API key configured.")
+        conn.close()
+        return
 
-    async with httpx.AsyncClient(http2=True, headers=headers, timeout=20.0) as client:
-        batch_size = 25
-        enriched_count = 0
-        
-        for i in range(0, total, batch_size):
-            chunk = jobs[i:i + batch_size]
-            tasks = [extract_skills_for_job(client, j) for j in chunk]
-            results = await asyncio.gather(*tasks)
+    tagged = 0
+    for n, batch in enumerate(batches, start=1):
+        try:
+            result = await gw.chat_json(
+                build_messages(batch),
+                max_tokens=60 * len(batch) + 200,
+                purpose="skills_backfill",
+                max_wait=120.0,   # offline script: happily wait for the limiter
+            )
+        except LLMUnavailable as exc:
+            print(f"Stopped: Groq unavailable ({exc.reason}); retry in ~{exc.retry_after:.0f}s. Re-run to continue.")
+            break
+        except (LLMTruncated, LLMBadResponse, GroqError) as exc:
+            print(f"Batch {n}/{len(batches)} skipped: {exc}")
+            continue
 
-            # Update DB with enriched skills
-            update_data = [(skills, job_id) for job_id, skills in results if skills]
-            if update_data:
-                with conn.cursor() as update_cur:
-                    execute_values(
-                        update_cur,
-                        """
-                        UPDATE public.jobs AS j
-                        SET skills = v.skills
-                        FROM (VALUES %s) AS v(skills, id)
-                        WHERE j.id = v.id;
-                        """,
-                        update_data,
-                        template="(%s::text[], %s)",
-                    )
-                enriched_count += len(update_data)
-
-            processed = min(i + batch_size, total)
-            print(f"Progress: {processed}/{total} jobs processed. Enriched: {enriched_count}", flush=True)
+        found = {job_id: skills for job_id, skills in parse_results(result.data, batch).items() if skills}
+        for job_id, skills in found.items():
+            cur.execute(
+                "UPDATE public.jobs SET skills = %s WHERE id = %s AND (skills IS NULL OR cardinality(skills) = 0);",
+                (skills, job_id),
+            )
+        tagged += len(found)
+        print(f"Batch {n}/{len(batches)}: tagged {len(found)}/{len(batch)} (total {tagged})", flush=True)
 
     conn.close()
-    print(f"Backfill complete! Successfully enriched {enriched_count}/{total} jobs.", flush=True)
+    await close_gateway()
+    print(f"Done. Tagged {tagged} jobs.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true", help="call Groq and write (default is dry-run)")
+    parser.add_argument("--limit", type=int, default=0, help="max jobs to process (0 = all)")
+    parser.add_argument("--batch-size", type=int, default=15)
+    args = parser.parse_args()
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set in .env")
+    asyncio.run(run(args))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
